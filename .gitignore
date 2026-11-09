@@ -1,0 +1,6 @@
+# drawings and reports made from them are personal; never commit them to this public repo
+*.json.gz
+/*.json
+hand.html
+health.html
+__pycache__/

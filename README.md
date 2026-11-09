@@ -149,6 +149,23 @@ python tools/health.py path/to/folder
 
 It prints a summary per device and writes `health.html` next to the drawings. The report covers the real sample rate and gaps (dropped samples), whether pressure tops out, whether tilt and hover are reported, and calibration, each marked OK, Check or Info with what to do. It also has histograms of sample timing, pressure, speed and tilt.
 
+`tools/hand.py` describes how you draw, from the movement in one drawing or a whole folder of them:
+
+```
+python tools/hand.py path/to/folder
+```
+
+It writes `hand.html` next to the drawings:
+- your marks by size (dots, ticks, short and long lines), with real examples of each
+- peak speed against length
+- how pressure rises and falls through a line
+- the directions lines travel
+- pauses and pen travel in the air between lines
+- lines inside each kind of part compared with the rest, and a summary per device
+- for each drawing: a timeline of what you drew in order, frames of how it grew, and the drawing coloured by when each line was drawn
+
+The statistics use the device samples as recorded and leave out lines tagged as fill. The report describes; it does not prove anything, and it gets more reliable with every drawing added. Drawings are personal: keep the reports out of the public repository.
+
 ## Known limits
 
 - Each drawing lives on the device where it was started; Drive holds the copies. Continuing one drawing across devices is not supported yet.
