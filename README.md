@@ -161,10 +161,11 @@ It writes `hand.html` next to the drawings:
 - how pressure rises and falls through a line
 - the directions lines travel
 - pauses and pen travel in the air between lines
+- white marks made with the eraser, as marks of their own (cutting white into the ink is drawing, not correcting)
 - lines inside each kind of part compared with the rest, and a summary per device
 - for each drawing: a timeline of what you drew in order, frames of how it grew, and the drawing coloured by when each line was drawn
 
-The statistics use the device samples as recorded and leave out lines tagged as fill. The report describes; it does not prove anything, and it gets more reliable with every drawing added. Drawings are personal: keep the reports out of the public repository.
+The statistics use the device samples as recorded. Lines tagged as fill are left out; white marks are measured on their own. The report describes; it does not prove anything, and it gets more reliable with every drawing added. Drawings are personal: keep the reports out of the public repository.
 
 ## Known limits
 

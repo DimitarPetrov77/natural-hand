@@ -31,6 +31,7 @@ CLASSES = [
     ("Long lines", 6.0, math.inf, "over 6 mm: contours, construction"),
 ]
 FILL = len(CLASSES)          # timeline category for lines tagged as fill
+WHITE = FILL + 1             # timeline category for white marks (eraser strokes: drawing in white, not corrections)
 SPEED_WINDOW_MS = 10         # speed is measured over at least this much time (dense pens jitter)
 BREAK_MS = 60_000            # pauses longer than this are breaks, not rhythm
 esc = html.escape
@@ -60,6 +61,7 @@ class Line:
     pause: float | None = None          # ms since the previous line ended
     travel: float | None = None         # mm from the previous line's end to this start
     cls: int = 0
+    white: bool = False       # an eraser stroke: a white mark cut into the ink
 
     @property
     def dur(self): return self.t1 - self.t0
@@ -74,8 +76,7 @@ class Sheet:
     paths: list               # (order, width_mm, "M..." path data) for every visible pen line
     timeline: list            # (t0, category) for every pen line, in time order
     undo: int = 0
-    erasers: int = 0
-    erased: int = 0
+    white: int = 0
     cancelled: int = 0
     span_min: float = 0.0
     pen_min: float = 0.0
@@ -119,13 +120,9 @@ def analyse(files):
         for st in order:
             raw = st.raw if st.cancelled else st.raw[:-1]   # last row is the pen-up event
             end = st.t0 + float(st.raw[-1, 0])
-            pen = st.tool != "eraser"
-            if st.tool == "eraser":
-                sh.erasers += not st.undone
+            white = st.tool == "eraser"
             sh.cancelled += st.cancelled
-            if pen and not st.undone and st.erased:
-                sh.erased += 1
-            if pen and not st.undone and not st.cancelled and len(raw):
+            if not st.undone and not st.cancelled and len(raw):
                 dev = dev_of.get(st.session, "?")
                 sh.devices.add(dev)
                 xy, t = raw[:, 1:3], raw[:, 0]
@@ -153,13 +150,14 @@ def analyse(files):
                 ln = Line(di, st.i, st.t0, end, len(raw), length, float(math.hypot(dx, dy)),
                           float(math.degrees(math.atan2(dy, dx)) % 360), peak,
                           length / dur * 1000 if dur > 0 else 0.0, float(np.nanmedian(p)) if np.isfinite(p).any() else math.nan,
-                          st.width_mm, st.brush, dev, kinds_of(st), "fill" in (st.tags or []), alt, tilt, prof)
-                ln.cls = cls_of(length)
+                          st.width_mm, st.brush, dev, [] if white else kinds_of(st), "fill" in (st.tags or []) and not white, alt, tilt, prof)
+                ln.cls, ln.white = cls_of(length), white
+                sh.white += white
                 if prev is not None:
                     ln.pause = st.t0 - prev[0]
                     ln.travel = float(math.hypot(*(xy[0] - prev[1])))
                 lines.append(ln)
-                sh.timeline.append((st.t0, FILL if ln.fill else ln.cls, end))
+                sh.timeline.append((st.t0, WHITE if white else FILL if ln.fill else ln.cls, end))
                 sh.pen_min += dur / 60000
             if len(raw):
                 prev = (end, raw[-1, 1:3])
@@ -389,7 +387,7 @@ def timeline(sh, n_win=40):
     n_win = min(n_win, len(tl) // 15)
     cuts = np.linspace(0, len(tl), n_win + 1).astype(int)
     t_start = tl[0][0]
-    names = [c[0] for c in CLASSES] + ["Fill (tagged)"]
+    names = [c[0] for c in CLASSES] + ["Fill (tagged)", "White (eraser)"]
     W, H, T, B = 640, 150, 6, 20
     bw = W / n_win
     out = []
@@ -437,7 +435,7 @@ def sheet_pictures(sh, idx):
     ramp = '<div class="ramp"><span>first lines</span>' + "".join(f'<i class="t{k}"></i>' for k in range(nb)) + '<span>last lines</span></div>'
     return (f'<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>{defs}</defs></svg>'
             f'<h3>How it grew</h3><div class="frames">{"".join(frames)}</div>'
-            f'<p class="note">Each frame adds a quarter of the lines, in black; earlier lines are grey. Lines are shown as they ended up, so parts erased later are already gone.</p>'
+            f'<p class="note">Each frame adds a quarter of the lines, in black; earlier lines are grey. Lines are shown as they ended up, with the white marks already cut in.</p>'
             f'<h3>When each part was drawn</h3><div class="tmap"><svg viewBox="{vb}" role="img" aria-label="The drawing coloured by when each line was drawn">'
             f'<rect class="paper2" x="{x0}" y="{y0}" width="{w}" height="{h}"/><g class="tink">{tmap}</g></svg>{ramp}</div>')
 
@@ -459,8 +457,10 @@ def table(head, rows, cls=""):
     return f'<div class="tw"><table class="{cls}"><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table></div>'
 
 
-def report(files, lines, sheets, rates, galleries):
-    motor = [l for l in lines if not l.fill]
+def report(files, lines, sheets, rates, galleries, white_gallery):
+    motor = [l for l in lines if not l.fill and not l.white]
+    whites = [l for l in lines if l.white]
+    n_fill = sum(l.fill for l in lines)
     N = len(motor)
     pauses = [l.pause for l in motor if l.pause is not None and l.pause < BREAK_MS]
     breaks = sum(1 for l in motor if l.pause is not None and l.pause >= BREAK_MS)
@@ -470,7 +470,7 @@ def report(files, lines, sheets, rates, galleries):
     devs = sorted({l.device for l in lines})
     # key numbers
     cards = [
-        ("Lines measured", f"{N:,}", f"{len(lines) - N:,} fill lines left out" if len(lines) - N else "all pen lines"),
+        ("Ink lines measured", f"{N:,}", ", ".join(x for x in (f"{n_fill:,} fill lines left out" if n_fill else "", f"{len(whites):,} white marks on their own" if whites else "") if x) or "all pen lines"),
         ("Typical line", g(med([l.length for l in motor]), "mm"), f"{g(med([l.dur for l in motor]), 'ms')} with the pen down"),
         ("Typical pause", g(med(pauses), "ms"), "between one line and the next"),
         ("Typical peak speed", g(med([l.peak for l in motor]), "mm/s"), f"fastest 1%: over {g(float(np.percentile([l.peak for l in motor], 99)) if motor else math.nan, 'mm/s')}"),
@@ -509,6 +509,44 @@ def report(files, lines, sheets, rates, galleries):
         body.append(f'<h3>{esc(name)} <span class="sub">{len(cells)} at random, {scale}</span></h3><div class="gal">{"".join(cells)}</div>')
     body.append('<div class="figs">' + hist([l.length for l in motor], 0.01, 100, log=True, unit="mm", caption="Line length (logarithmic scale)") +
                 hist([l.dur for l in motor], 1, 5000, log=True, unit="ms", caption="Time with the pen down per line (logarithmic scale)") + "</div></section>")
+
+    # white marks
+    if whites:
+        rows = []
+        for k, (name, lo, hi, what) in enumerate(CLASSES):
+            ls = [l for l in whites if l.cls == k]
+            if ls:
+                rows.append([esc(name), f"{len(ls):,}", pct(len(ls), len(whites)), g(med([l.dur for l in ls]), "ms"),
+                             g(med([l.peak for l in ls]), "mm/s"), g(med([l.pressure for l in ls]), "", 2),
+                             esc(", ".join(f"{w:g}" for w in sorted({l.width for l in ls}))) + " mm"])
+        rows.append(["<b>All white marks</b>", f"<b>{len(whites):,}</b>", "", g(med([l.dur for l in whites]), "ms"),
+                     g(med([l.peak for l in whites]), "mm/s"), g(med([l.pressure for l in whites]), "", 2), ""])
+        rows.append(["All ink lines", f"{N:,}", "", g(med([l.dur for l in motor]), "ms"), g(med([l.peak for l in motor]), "mm/s"),
+                     g(med([l.pressure for l in motor]), "", 2), ""])
+        ts = sorted((l.d, l.t0) for l in whites)
+        spans, start = [], ts[0]
+        for a_, b_ in zip(ts, ts[1:] + [None]):
+            if b_ is None or b_[0] != a_[0] or b_[1] - a_[1] > 5 * 60000:
+                t_first = min(t for t, _, _ in sheets[start[0]].timeline)
+                m0, m1 = round((start[1] - t_first) / 60000), round((a_[1] - t_first) / 60000)
+                spans.append(f"{m0}–{m1} min" if m1 > m0 else f"{m0} min")
+                start = b_
+        cells = []
+        for l, seg in white_gallery:
+            if seg is None or not len(seg):
+                continue
+            box = {0: 0.6, 1: 2.0, 2: 7.0}.get(l.cls)
+            cx, cy = (seg[:, 0].min() + seg[:, 0].max()) / 2, (seg[:, 1].min() + seg[:, 1].max()) / 2
+            size = max(box or max(np.ptp(seg[:, 0]), np.ptp(seg[:, 1]), 1) * 1.15, max(np.ptp(seg[:, 0]), np.ptp(seg[:, 1])) + l.width * 1.6)
+            tip = f"White {CLASSES[l.cls][0].lower().rstrip('s')}: {g(l.length, 'mm')}, {l.width:g} mm wide, {g(l.dur, 'ms')}, pressure {g(l.pressure, '', 2)}"
+            cells.append(f'<svg class="cell neg" viewBox="{cx - size / 2:.3f} {cy - size / 2:.3f} {size:.3f} {size:.3f}" data-tip="{esc(tip)}" role="img" aria-label="{esc(tip)}">'
+                         f'<path d="{path_data(seg.tolist(), step=size / 200)}" style="stroke-width:{max(l.width, size / 60):.3f}"/></svg>')
+        body.append(f'<section><h2>White marks</h2><p class="lead">{len(whites):,} marks made with the eraser, cutting white into the ink: '
+                    f'drawing in white, not corrections. Made in {len(spans)} stretch{"es" * (len(spans) != 1)}: {esc(", ".join(spans))}.</p>'
+                    + table(["Mark", "Marks", "Share", "Pen down", "Peak speed", "Pressure", "Widths"], rows, "num")
+                    + '<p class="note">Medians. Sizes are sorted by the same lengths as ink lines.</p>'
+                    + f'<h3>Examples <span class="sub">{len(cells)} at random, at their real width; boxes as for ink lines, or larger to fit a wide mark</span></h3>'
+                    + f'<div class="gal">{"".join(cells)}</div></section>')
 
     # speed
     sc, fit = scatter_speed(motor)
@@ -572,14 +610,13 @@ def report(files, lines, sheets, rates, galleries):
     # drawings
     for idx, sh in enumerate(sheets):
         nm = esc(sh.title or sh.id)
-        facts = (f"{len(sh.timeline):,} lines, {sh.pen_min:.0f} min with the pen down over {sh.span_min:.0f} min; "
-                 f"{sh.undo} undo{'s' * (sh.undo != 1)}, {sh.erasers} eraser stroke{'s' * (sh.erasers != 1)} touching {sh.erased} line{'s' * (sh.erased != 1)}"
-                 f"{f', {sh.cancelled} cancelled' if sh.cancelled else ''}. {esc(', '.join(sorted(sh.devices)))}.")
+        facts = (f"{len(sh.timeline) - sh.white:,} ink lines and {sh.white:,} white marks, {sh.pen_min:.0f} min with the pen down over {sh.span_min:.0f} min; "
+                 f"{sh.undo} undo{'s' * (sh.undo != 1)}{f', {sh.cancelled} cancelled' if sh.cancelled else ''}. {esc(', '.join(sorted(sh.devices)))}.")
         body.append(f'<section><h2>{nm}</h2><p class="lead">{facts}</p>{timeline(sh)}{sheet_pictures(sh, idx)}</section>')
 
     src = ", ".join(esc(Path(p).name) for p in files[:6]) + (f" and {len(files) - 6} more" if len(files) > 6 else "")
     head = (f'<h1>Your hand</h1><p class="sub">{len(files)} drawing{"s" * (len(files) != 1)}: {src}. '
-            f'Movement from the pen as recorded; fill lines left out of the statistics. Hover or tap a chart for numbers.</p>')
+            f'Movement from the pen as recorded. Statistics are for ink lines; fill lines are left out and white marks (made with the eraser) have their own section. Hover or tap a chart for numbers.</p>')
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>Your hand</title><style>{CSS}</style></head><body><main>{head}{"".join(body)}</main>'
             f'<div id="tip" role="tooltip" hidden></div><script>{JS}</script></body></html>')
@@ -587,10 +624,10 @@ def report(files, lines, sheets, rates, galleries):
 
 CSS = """
 :root{color-scheme:light;--bg:#fbfaf7;--ink:#1d1c1a;--muted:#5f5c56;--line:#e3e0d8;--grid:#eceae4;--card:#f3f1ec;
---s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--paper:#ffffff;--pen:#141414;
+--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--s6:#8f8b84;--paper:#ffffff;--pen:#141414;
 --t0:#86b6ef;--t1:#6da7ec;--t2:#5598e7;--t3:#3987e5;--t4:#2a78d6;--t5:#256abf;--t6:#1c5cab;--t7:#104281;--tpaper:#ffffff}
 @media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#171715;--ink:#ecebe6;--muted:#aaa69e;--line:#33312d;--grid:#262522;--card:#201f1d;
---s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--paper:#f4f2ec;--pen:#141414;
+--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#e4e1da;--paper:#f4f2ec;--pen:#141414;
 --t0:#184f95;--t1:#1c5cab;--t2:#256abf;--t3:#2a78d6;--t4:#3987e5;--t5:#6da7ec;--t6:#9ec5f4;--t7:#cde2fb;--tpaper:#1a1a19}}
 *{box-sizing:border-box}
 body{background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;margin:0;padding:24px 16px 64px}
@@ -627,12 +664,13 @@ svg text{fill:var(--muted);font-size:11px}
 .ser.s1,.lead.s1{stroke:var(--s1)} .ser.s2,.lead.s2{stroke:var(--s2)} .ser.s3,.lead.s3{stroke:var(--s3)} .ser.s4,.lead.s4{stroke:var(--s4)}
 .lead{stroke-width:1} svg text.lbl{fill:var(--ink)}
 rect.s1,.sw.s1{fill:var(--s1);background:var(--s1)} rect.s2,.sw.s2{fill:var(--s2);background:var(--s2)} rect.s3,.sw.s3{fill:var(--s3);background:var(--s3)}
-rect.s4,.sw.s4{fill:var(--s4);background:var(--s4)} rect.s5,.sw.s5{fill:var(--s5);background:var(--s5)}
+rect.s4,.sw.s4{fill:var(--s4);background:var(--s4)} rect.s5,.sw.s5{fill:var(--s5);background:var(--s5)} rect.s6,.sw.s6{fill:var(--s6);background:var(--s6)}
 .legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:.82rem;margin-bottom:6px}
 .legend span{display:inline-flex;align-items:center;gap:6px}
 .sw{display:inline-block;width:10px;height:10px;border-radius:3px;vertical-align:-1px}
 .gal{display:grid;grid-template-columns:repeat(auto-fill,minmax(64px,1fr));gap:6px}
-.cell{aspect-ratio:1;background:var(--paper);border-radius:6px}
+.cell{overflow:hidden;aspect-ratio:1;background:var(--paper);border-radius:6px}
+.cell.neg{background:#141414} .cell.neg path{stroke:#ffffff;vector-effect:none}
 .cell path{fill:none;stroke:var(--pen);stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke}
 .frames{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(46%,200px),1fr));gap:12px}
 .frame figcaption{margin:4px 0 0}
@@ -668,7 +706,8 @@ def main():
     if not files:
         sys.exit(f"No drawings found in {p}")
     lines, sheets, rates = analyse(files)
-    motor = [l for l in lines if not l.fill]
+    motor = [l for l in lines if not l.fill and not l.white]
+    whites = [l for l in lines if l.white]
     if not motor:
         sys.exit("No finished pen lines to measure.")
     # example marks for the galleries: the drawn path of a few lines of each kind
@@ -684,12 +723,17 @@ def main():
             seg = st.drawn[:, 1:3]
             out.append((l, seg))
         galleries.append(out)
-    html_out = report([str(f) for f in files], lines, sheets, rates, galleries)
+    white_gallery = []
+    for l in random.Random(9).sample(whites, min(24, len(whites))):
+        if l.d not in by_d:
+            by_d[l.d] = {s.i: s for s in load_drawing(files[l.d]).strokes}
+        white_gallery.append((l, by_d[l.d][l.i].drawn[:, 1:3]))
+    html_out = report([str(f) for f in files], lines, sheets, rates, galleries, white_gallery)
     out = Path(a.out) if a.out else (p if p.is_dir() else p.parent) / "hand.html"
     out.write_text(html_out, encoding="utf-8")
     N = len(motor)
     pauses = [l.pause for l in motor if l.pause is not None and l.pause < BREAK_MS]
-    print(f"{len(files)} drawing(s), {N} pen lines measured ({len(lines) - N} fill lines left out)")
+    print(f"{len(files)} drawing(s), {N} ink lines measured ({sum(l.fill for l in lines)} fill lines left out), {len(whites)} white marks (eraser)")
     for k, (name, *_r) in enumerate(CLASSES):
         ls = [l for l in motor if l.cls == k]
         print(f"  {name:12} {len(ls):6}  {100 * len(ls) / N:4.0f}%   median {med([l.dur for l in ls]):6.0f} ms, peak {med([l.peak for l in ls]):6.1f} mm/s")
