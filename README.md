@@ -34,6 +34,8 @@ Google's sign-in lasts about an hour. When it runs out, the Drive chip in the to
 
 Open the GitHub Pages address in Chrome, then menu, **Add to home screen** (or Install app). It opens full screen and works offline.
 
+**Opening a drawing.** While a drawing opens, a loading screen shows its preview and what is happening (reading lines, drawing the page) with a progress bar; the pen does nothing until the drawing is ready. Drawings made with older versions do some one-time work the first time they open (converting figures to parts, working out erased lines), and the screen says so. Changes from your other devices are pulled in after the drawing is on screen, in the background; you can keep drawing meanwhile.
+
 Updates install themselves in the background. When one is ready, a dark **New version ready. Reload** chip appears in the top corner; tap it when you are between strokes. It saves first, then reloads. The app checks for updates each time you come back to it, and every 30 minutes while it is open.
 
 ## 4. Set up each device

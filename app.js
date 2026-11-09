@@ -8,7 +8,7 @@
 'use strict';
 (() => {
 
-const APP_VERSION = '0.7.0';
+const APP_VERSION = '0.7.1';
 const FORMAT = 'natural-hand/1';
 const SAMPLE_FIELDS = ['dt_ms','x_mm','y_mm','pressure','tiltX','tiltY','twist','altitude','azimuth','tangential','width_px','height_px','buttons'];
 const PAPERS = { A5: [148, 210], A4: [210, 297], A3: [297, 420], A2: [420, 594], A1: [594, 841], Square: [300, 300] };
@@ -79,13 +79,19 @@ const DB = {
   add(store, v) { return this.write(store, (tx) => tx.objectStore(store).add(v)); },
   get(store, k) { return this.read(store, (s) => s.get(k)); },
   all(store) { return this.read(store, (s) => s.getAll()); },
-  async strokes(id) { // in batches: each batch is decoded separately, so the page keeps breathing
+  // In batches: each batch is decoded on its own, so the page keeps breathing. The batch
+  // size follows how long the last one took, since lines vary from 2 to thousands of samples.
+  async strokes(id, onBatch) {
     const out = [];
+    let n = 100;
     for (;;) {
-      const lo = out.length ? out[out.length - 1].i : 0;
-      const part = await this.read('strokes', (s) => s.getAll(IDBKeyRange.bound([id, lo], [id, Infinity], out.length > 0), 500));
+      const lo = out.length ? out[out.length - 1].i : 0, t = performance.now();
+      const part = await this.read('strokes', (s) => s.getAll(IDBKeyRange.bound([id, lo], [id, Infinity], out.length > 0), n));
+      const dt = performance.now() - t;
       for (const st of part) out.push(st);
-      if (part.length < 500) return out;
+      if (onBatch) await onBatch(part, out.length);
+      if (part.length < n) return out;
+      n = clamp(Math.round(n * 25 / Math.max(dt, 1)), Math.max(20, n >> 2), Math.min(n * 2, 1000)); // aim for about 25 ms a batch
     }
   },
   events(id) { return this.read('events', (s) => s.index('drawing').getAll(id)); },
@@ -95,7 +101,16 @@ const DB = {
       tx.objectStore('drawings').put(meta);
       const ss = tx.objectStore('strokes');
       ss.delete(IDBKeyRange.bound([id, 0], [id, Infinity]));
-      for (const st of strokes) ss.put(st);
+      // still one transaction (all or nothing), but each put copies its stroke on this thread,
+      // so they go in slices: the next slice starts when the last put of this one is done
+      let i = 0;
+      const next = () => {
+        const end = performance.now() + 12;
+        let last = null;
+        while (i < strokes.length && performance.now() < end) last = ss.put(strokes[i++]);
+        if (i < strokes.length) last.onsuccess = next;
+      };
+      next();
       const es = tx.objectStore('events');
       es.index('drawing').openKeyCursor(IDBKeyRange.only(id)).onsuccess = (e) => {
         const c = e.target.result;
@@ -138,6 +153,7 @@ const S = {
   kind: localStorage.getItem('nh-kind') || 'Figure', // kind the part button starts
   fill: false,
   active: null,        // {st, id}
+  loading: false,      // a drawing is being opened: no drawing input until it is ready
   hover: [],
   hoverDropped: 0,
   redo: [],
@@ -434,65 +450,92 @@ function segSeg(p, q, A, B) {
   return Math.min(ptSeg(p[1], p[2], A, B), ptSeg(q[1], q[2], A, B), ptSeg(A[1], A[2], [0, p[1], p[2]], [0, q[1], q[2]]), ptSeg(B[1], B[2], [0, p[1], p[2]], [0, q[1], q[2]]));
 }
 // the parts of earlier, visible strokes that one eraser stroke removes: Map(stroke -> ranges)
+// Fast pens report a sample every ~0.02 mm, so this is built for dense data: eraser segments go
+// into a fine grid (each cell lists every segment within reach of it), so a sample far from the
+// eraser costs one lookup, and a whole-line eraser stops at a line's first touched sample.
 function eraserHits(E, strokes, result = new Map()) {
-  {
-    if (E.tool !== 'eraser' || E.undone_at || !E.samples.length) return result;
-    const whole = eraseModeOf(E) === 'stroke';
-    // reach: the eraser's half width plus up to 2 mm for the touched line's own width;
-    // whole-line erasing gets at least 0.75 mm so thin lines are easy to hit
-    const reach = E.width_mm / 2 + 2;
-    const r0 = E.width_mm / 2, eb0 = bboxOf(E), eb = { x0: eb0.x0 - 2, y0: eb0.y0 - 2, x1: eb0.x1 + 2, y1: eb0.y1 + 2 };
-    const cell = Math.max(reach * 2, 0.5), grid = new Map(), r = reach;
-    const key = (cx, cy) => cx * 100003 + cy;
-    const segs = E.samples.length === 1 ? [[0, 0]] : E.samples.slice(1).map((_, i) => [i, i + 1]);
-    for (const [i0, i1] of segs) {
-      const A = E.samples[i0], B = E.samples[i1];
-      const x0 = Math.floor((Math.min(A[1], B[1]) - r) / cell), x1 = Math.floor((Math.max(A[1], B[1]) + r) / cell);
-      const y0 = Math.floor((Math.min(A[2], B[2]) - r) / cell), y1 = Math.floor((Math.max(A[2], B[2]) + r) / cell);
-      for (let cx = x0; cx <= x1; cx++) for (let cy = y0; cy <= y1; cy++) {
-        const k = key(cx, cy); if (!grid.has(k)) grid.set(k, []); grid.get(k).push([A, B]);
+  if (E.tool !== 'eraser' || E.undone_at || !E.samples.length) return result;
+  const whole = eraseModeOf(E) === 'stroke';
+  // reach: the eraser's half width plus the touched line's half width;
+  // whole-line erasing gets at least 0.75 mm so thin lines are easy to hit
+  const r0 = E.width_mm / 2, eb0 = bboxOf(E), eb = { x0: eb0.x0 - 2, y0: eb0.y0 - 2, x1: eb0.x1 + 2, y1: eb0.y1 + 2 };
+  const cands = [];
+  let maxW = 0;
+  for (const T of strokes) {
+    if (T.tool === 'eraser' || T.undone_at || T.t0 >= E.t0 || !T.samples.length) continue;
+    const tb = bboxOf(T);
+    if (tb.x1 < eb.x0 || tb.x0 > eb.x1 || tb.y1 < eb.y0 || tb.y0 > eb.y1) continue;
+    cands.push(T); if (T.width_mm > maxW) maxW = T.width_mm;
+  }
+  if (!cands.length) return result;
+  const R = Math.max(whole ? 0.75 : 0, r0 + maxW / 2) + 1e-6, cell = Math.max(0.25, R / 2);
+  const oldCell = Math.max((r0 + 2) * 2, 0.5), maxCells = 400 * (oldCell / cell) ** 2; // same cut-off for very long jumps as before
+  const grid = new Map(), key = (cx, cy) => cx * 1000003 + cy;
+  const ES = E.samples, segs = ES.length === 1 ? [[ES[0], ES[0]]] : [];
+  for (let i = 1; i < ES.length; i++) segs.push([ES[i - 1], ES[i]]);
+  for (const sg of segs) {
+    const [A, B] = sg;
+    const x0 = Math.floor((Math.min(A[1], B[1]) - R) / cell), x1 = Math.floor((Math.max(A[1], B[1]) + R) / cell);
+    const y0 = Math.floor((Math.min(A[2], B[2]) - R) / cell), y1 = Math.floor((Math.max(A[2], B[2]) + R) / cell);
+    for (let cx = x0; cx <= x1; cx++) for (let cy = y0; cy <= y1; cy++) {
+      const k = key(cx, cy), l = grid.get(k);
+      if (!l) grid.set(k, [sg]); else if (l[l.length - 1] !== sg) l.push(sg);
+    }
+  }
+  const near = (px, py, rr) => {
+    const l = grid.get(key(Math.floor(px / cell), Math.floor(py / cell)));
+    if (l) for (let j = 0; j < l.length; j++) if (ptSeg(px, py, l[j][0], l[j][1]) <= rr) return true;
+    return false;
+  };
+  const seen = new Set();
+  // the eraser segment nearest-crossing a line segment p-q within rr, if any (fast, sparse strokes)
+  const crosses = (p, q, rr) => {
+    const x0 = Math.floor(Math.min(p[1], q[1]) / cell), x1 = Math.floor(Math.max(p[1], q[1]) / cell);
+    const y0 = Math.floor(Math.min(p[2], q[2]) / cell), y1 = Math.floor(Math.max(p[2], q[2]) / cell);
+    if ((x1 - x0 + 1) * (y1 - y0 + 1) > maxCells) return null;
+    if (x0 === x1 && y0 === y1) {
+      const l = grid.get(key(x0, y0));
+      if (l) for (const sg of l) if (segSeg(p, q, sg[0], sg[1]) <= rr) return sg;
+      return null;
+    }
+    seen.clear();
+    for (let cx = x0; cx <= x1; cx++) for (let cy = y0; cy <= y1; cy++) {
+      const l = grid.get(key(cx, cy));
+      if (l) for (const sg of l) {
+        if (seen.has(sg)) continue;
+        seen.add(sg);
+        if (segSeg(p, q, sg[0], sg[1]) <= rr) return sg;
       }
     }
-    for (const T of strokes) {
-      if (T.tool === 'eraser' || T.undone_at || T.t0 >= E.t0) continue;
-      const tb = bboxOf(T);
-      if (tb.x1 < eb.x0 || tb.x0 > eb.x1 || tb.y1 < eb.y0 || tb.y0 > eb.y1) continue;
-      // a sample is erased if it lies under the eraser; a segment the eraser crosses
-      // between two samples (fast, sparse strokes) loses its endpoint nearest the eraser
-      const hitSet = new Set(), TS = T.samples;
-      const rr = whole ? Math.max(0.75, r0 + T.width_mm / 2) : r0 + T.width_mm / 2;
-      const cellsOf = (ax, ay, bx, by) => {
-        const out = new Set();
-        const x0 = Math.floor(Math.min(ax, bx) / cell), x1 = Math.floor(Math.max(ax, bx) / cell);
-        const y0 = Math.floor(Math.min(ay, by) / cell), y1 = Math.floor(Math.max(ay, by) / cell);
-        if ((x1 - x0 + 1) * (y1 - y0 + 1) > 400) return null;
-        for (let cx = x0; cx <= x1; cx++) for (let cy = y0; cy <= y1; cy++) { const l = grid.get(key(cx, cy)); if (l) for (const sg of l) out.add(sg); }
-        return out;
-      };
-      for (let idx = 0; idx < TS.length; idx++) {
-        const p = TS[idx], list = grid.get(key(Math.floor(p[1] / cell), Math.floor(p[2] / cell)));
-        if (list && list.some(([A, B]) => ptSeg(p[1], p[2], A, B) <= rr)) hitSet.add(idx);
-      }
+    return null;
+  };
+  for (const T of cands) {
+    // a sample is erased if it lies under the eraser; a segment the eraser crosses
+    // between two samples loses its endpoint nearest the eraser
+    const TS = T.samples, rr = whole ? Math.max(0.75, r0 + T.width_mm / 2) : r0 + T.width_mm / 2;
+    const hit = new Uint8Array(TS.length);
+    let any = false;
+    for (let idx = 0; idx < TS.length; idx++) {
+      if (near(TS[idx][1], TS[idx][2], rr)) { hit[idx] = 1; any = true; if (whole) break; }
+    }
+    if (!(whole && any)) {
       for (let idx = 1; idx < TS.length; idx++) {
-        if (hitSet.has(idx) || hitSet.has(idx - 1)) continue;
-        const p = TS[idx - 1], q = TS[idx];
-        const cand = cellsOf(p[1], p[2], q[1], q[2]);
-        if (!cand) continue;
-        for (const [A, B] of cand) {
-          if (segSeg(p, q, A, B) <= rr) { hitSet.add(ptSeg(p[1], p[2], A, B) <= ptSeg(q[1], q[2], A, B) ? idx - 1 : idx); break; }
-        }
+        if (hit[idx] || hit[idx - 1]) continue;
+        const p = TS[idx - 1], q = TS[idx], sg = crosses(p, q, rr);
+        if (!sg) continue;
+        hit[ptSeg(p[1], p[2], sg[0], sg[1]) <= ptSeg(q[1], q[2], sg[0], sg[1]) ? idx - 1 : idx] = 1;
+        any = true;
+        if (whole) break;
       }
-      const hit = [...hitSet].sort((a, b) => a - b);
-      if (!hit.length) continue;
-      if (!result.has(T)) result.set(T, []);
-      const ranges = result.get(T);
-      if (whole) { ranges.push([0, TS.length - 1, E.i]); continue; }
-      let a0 = hit[0], prev = hit[0];
-      for (let k = 1; k <= hit.length; k++) {
-        if (k < hit.length && hit[k] === prev + 1) { prev = hit[k]; continue; }
-        ranges.push([a0, prev, E.i]);
-        if (k < hit.length) { a0 = prev = hit[k]; }
-      }
+    }
+    if (!any) continue;
+    if (!result.has(T)) result.set(T, []);
+    const ranges = result.get(T);
+    if (whole) { ranges.push([0, TS.length - 1, E.i]); continue; }
+    for (let k = 0; k < TS.length; k++) {
+      if (!hit[k]) continue;
+      let e = k; while (e + 1 < TS.length && hit[e + 1]) e++;
+      ranges.push([k, e, E.i]); k = e;
     }
   }
   return result;
@@ -502,6 +545,19 @@ function eraserHits(E, strokes, result = new Map()) {
 function computeErasure(strokes) {
   const result = new Map();
   for (const E of strokes) eraserHits(E, strokes, result);
+  return applyErasure(strokes, result);
+}
+// the same, a few erasers at a time so the page stays responsive
+async function computeErasureAsync(strokes, onProgress) {
+  const result = new Map(), erasers = strokes.filter((E) => E.tool === 'eraser');
+  let end = performance.now() + 12;
+  for (let k = 0; k < erasers.length; k++) {
+    eraserHits(erasers[k], strokes, result);
+    if (performance.now() > end) { if (onProgress) onProgress(k / erasers.length); await yieldNow(); end = performance.now() + 12; }
+  }
+  return applyErasure(strokes, result);
+}
+function applyErasure(strokes, result) {
   const changed = [];
   for (const T of strokes) {
     if (T.tool === 'eraser' || T.undone_at) continue;
@@ -548,22 +604,27 @@ function paintAll(ctx, strokes, b, K, bg = '#ffffff') {
  * ink and region repaints during a slow repaint are fine: finished ink is all black. */
 let paintGen = 0, painting = false;
 const yieldNow = () => new Promise((r) => setTimeout(r, 0));
-function repaint() {
+// resolves when the page is fully painted (or a newer repaint took over)
+function repaint(onProgress) {
   const gen = ++paintGen, p = S.paper, { x, K, b } = p, list = S.strokes.slice();
   x.setTransform(1, 0, 0, 1, 0, 0);
   x.fillStyle = '#ffffff'; x.fillRect(0, 0, x.canvas.width, x.canvas.height);
   x.setTransform(K, 0, 0, K, -b.x0 * K, -b.y0 * K);
   painting = true;
   let i = 0;
-  const slice = () => {
-    if (gen !== paintGen || S.paper !== p) return;
-    const end = performance.now() + 12;
-    x.setTransform(K, 0, 0, K, -b.x0 * K, -b.y0 * K);
-    while (i < list.length && performance.now() < end) { const st = list[i++]; if (visibleInk(st)) drawStroke(x, st); }
-    if (i < list.length) setTimeout(slice, 0); else painting = false;
-    invalidateSharp(); requestRender();
-  };
-  slice();
+  return new Promise((done) => {
+    const slice = () => {
+      if (gen !== paintGen || S.paper !== p) { done(false); return; }
+      const end = performance.now() + (S.loading ? 30 : 12); // nothing to respond to behind the loading screen
+      x.setTransform(K, 0, 0, K, -b.x0 * K, -b.y0 * K);
+      while (i < list.length && performance.now() < end) { const st = list[i++]; if (visibleInk(st)) drawStroke(x, st); }
+      if (onProgress) onProgress(list.length ? i / list.length : 1);
+      if (i < list.length) setTimeout(slice, 0); else { painting = false; done(true); }
+      invalidateSharp();
+      if (!S.loading) requestRender(); // behind the loading screen the view is shown once, at the end
+    };
+    slice();
+  });
 }
 const unionBox = (a, b) => ({ x0: Math.min(a.x0, b.x0), y0: Math.min(a.y0, b.y0), x1: Math.max(a.x1, b.x1), y1: Math.max(a.y1, b.y1) });
 const boxesMeet = (a, b) => !(a.x1 < b.x0 || a.x0 > b.x1 || a.y1 < b.y0 || a.y0 > b.y1);
@@ -652,7 +713,7 @@ const touches = new Map();
 let gesture = null, mousePan = null, spaceDown = false;
 
 function onDown(e) {
-  if (!S.meta || document.querySelector('dialog[open]')) return;
+  if (!S.meta || S.loading || document.querySelector('dialog[open]')) return;
   hideNibs();
   if (e.pointerType === 'pen' && e.button === 2) { e.preventDefault(); penButton(); return; }
   if (Replay.on && e.pointerType !== 'touch') {
@@ -790,6 +851,14 @@ function finish(e, cancelled) {
 }
 function saveStroke(st) {
   DB.put('strokes', st).catch((err) => { toast('Could not save a stroke: ' + err.message); setSaveState('Save failed', true); });
+}
+// many strokes at once (opening older drawings): a few at a time, since each one is copied on this thread
+async function saveStrokes(list) {
+  for (let i = 0; i < list.length;) {
+    const end = performance.now() + 12, from = i;
+    await DB.write('strokes', (tx) => { const os = tx.objectStore('strokes'); while (i < list.length && (i === from || performance.now() < end)) os.put(list[i++]); })
+      .catch((err) => { toast('Could not save a stroke: ' + err.message); setSaveState('Save failed', true); });
+  }
 }
 function logEvent(type, extra = {}) {
   if (!S.meta) return;
@@ -956,7 +1025,7 @@ async function flushMeta() {
   clearTimeout(metaTimer);
   if (!S.meta) return;
   S.meta.updated = new Date().toISOString();
-  if (!painting) try { S.meta.thumb = makeThumb(); } catch {}
+  if (!painting && !S.loading) try { S.meta.thumb = makeThumb(); } catch {}
   try { await DB.put('drawings', S.meta); setSaveState('Saved'); }
   catch (err) { setSaveState('Save failed', true); toast('Could not save drawing: ' + err.message); }
   updateDriveChip();
@@ -983,35 +1052,97 @@ async function newDrawing(paperName, landscape, title) {
   await DB.put('drawings', meta);
   await openDrawing(meta.id);
 }
+/* Loading screen. It is in the page from the first paint, so it shows while the app starts;
+ * when switching drawings it appears only if opening takes more than a moment. */
+const Loader = {
+  timer: 0,
+  show(title, thumb, quick) {
+    const el = $('#loader');
+    clearTimeout(this.timer);
+    if (el.hidden) { el.hidden = false; el.classList.add('wait'); }
+    if (quick || !el.classList.contains('wait')) el.classList.remove('wait');
+    else this.timer = setTimeout(() => el.classList.remove('wait'), 150);
+    $('#ld-title').textContent = title || 'Opening your drawing';
+    const im = $('#ld-thumb');
+    if (thumb) { im.src = thumb; im.hidden = false; } else { im.hidden = true; im.removeAttribute('src'); }
+    $('#ld-acts').hidden = true; $('#ld-bar').hidden = false;
+    this.set(0, 'Starting');
+  },
+  set(f, text) {
+    const pc = Math.round(clamp(f, 0, 1) * 100);
+    $('#ld-fill').style.width = pc + '%';
+    $('#ld-bar').setAttribute('aria-valuenow', String(pc));
+    if (text != null) $('#ld-step').textContent = text;
+  },
+  fail(msg) {
+    clearTimeout(this.timer);
+    const el = $('#loader');
+    el.hidden = false; el.classList.remove('wait');
+    $('#ld-bar').hidden = true; $('#ld-step').textContent = msg; $('#ld-acts').hidden = false;
+  },
+  hide() { clearTimeout(this.timer); $('#loader').hidden = true; },
+};
+const count = (n) => n.toLocaleString('en');
+let loadGen = 0;
 async function openDrawing(id) {
+  const gen = ++loadGen;
   if (Replay.on) Replay.close();
   if (S.prompt && (!S.meta || S.meta.id !== id)) endPrompt(false);
-  if (S.meta) await flushMeta();
-  const meta = await DB.get('drawings', id);
-  if (!meta) { toast('That drawing is no longer on this device.'); return; }
-  const strokes = (await DB.strokes(id)).sort((a, b) => a.i - b.i).map(normalizeStroke);
-  Object.assign(S, {
-    meta, strokes, redo: [], partStack: [], fill: false, hover: [], hoverDropped: 0, active: null,
-    endless: !!meta.paper.endless, sessionId: `${Date.now().toString(36)}-${uid()}`, sessionLogged: false,
-  });
-  const migrated = migrateFigures(meta, strokes);
-  for (const st of migrated) saveStroke(st);
-  if (migrated.length) scheduleMetaSave();
-  S.paper = makePaper(boundsOfMeta(meta, strokes));
-  // erased parts are stored with each stroke; drawings from before the vector eraser get them computed once
-  if (meta.erasure !== 1) {
-    for (const st of computeErasure(strokes)) saveStroke(st);
-    meta.erasure = 1; scheduleMetaSave();
+  S.loading = true;
+  Loader.show('Opening your drawing', null, !S.meta);
+  let ok = false;
+  try {
+    if (S.meta) await flushMeta();
+    const meta = await DB.get('drawings', id);
+    if (!meta) { toast('That drawing is no longer on this device.'); ok = !!S.meta; return; }
+    if (gen !== loadGen) return;
+    const total = meta.stroke_count || 0;
+    Loader.show(meta.title || 'Opening your drawing', meta.thumb, !S.meta);
+    // 1. read the lines from storage (about half of the time on big drawings)
+    const strokes = await DB.strokes(id, (part, n) => {
+      for (const st of part) { normalizeStroke(st); bboxOf(st); }
+      Loader.set(0.5 * (total ? Math.min(1, n / total) : 1), `Reading lines: ${count(n)} of ${count(Math.max(n, total))}`);
+    });
+    if (gen !== loadGen) return;
+    strokes.sort((a, b) => a.i - b.i);
+    Object.assign(S, {
+      meta, strokes, redo: [], partStack: [], fill: false, hover: [], hoverDropped: 0, active: null,
+      endless: !!meta.paper.endless, sessionId: `${Date.now().toString(36)}-${uid()}`, sessionLogged: false,
+    });
+    const migrated = migrateFigures(meta, strokes);
+    if (migrated.length) { Loader.set(0.5, 'Converting figures to parts (first time only)'); await saveStrokes(migrated); scheduleMetaSave(); }
+    if (gen !== loadGen) return;
+    S.paper = makePaper(boundsOfMeta(meta, strokes));
+    // 2. erased parts are stored with each stroke; drawings from before the vector eraser get them computed once
+    let p0 = 0.5;
+    if (meta.erasure !== 1) {
+      Loader.set(0.5, 'Working out erased lines (first time only)');
+      const changed = await computeErasureAsync(strokes, (f) => Loader.set(0.5 + 0.15 * f));
+      if (gen !== loadGen) return;
+      await saveStrokes(changed);
+      meta.erasure = 1; scheduleMetaSave(); p0 = 0.65;
+    }
+    localStorage.setItem('nh-last', id);
+    if (meta.view) S.view = { ...meta.view }; else fit();
+    updateTools(); setSaveState('Saved'); updateDriveChip();
+    // 3. paint the page
+    Loader.set(p0, 'Drawing the page');
+    await repaint((f) => Loader.set(p0 + (1 - p0) * f, `Drawing the page: ${Math.round(f * 100)}%`));
+    ok = true;
+  } catch (err) {
+    if (gen === loadGen) {
+      S.loading = false;
+      Loader.fail(`Could not open this drawing: ${err && err.message || err}. Nothing was deleted.`);
+    }
+    return;
+  } finally {
+    if (gen === loadGen && ok) { S.loading = false; Loader.hide(); invalidateSharp(); requestRender(); }
   }
-  repaint();
-  localStorage.setItem('nh-last', id);
-  if (meta.view) S.view = { ...meta.view }; else fit();
-  updateTools(); setSaveState('Saved'); updateDriveChip();
-  requestRender();
-  if (Drive.ready() && navigator.onLine) pullCurrent();
+  // check Drive for changes from other devices once the drawing is on screen
+  if (gen === loadGen && Drive.ready() && navigator.onLine) pullCurrent();
 }
 async function pullCurrent() {
-  if (syncing || !S.meta) return;
+  if (syncing || !S.meta || S.loading) return;
   syncing = true; updateDriveChip();
   try { await syncOne(S.meta.id); lastSync = new Date(); syncError = null; }
   catch (err) { syncError = err.message; }
@@ -1104,7 +1235,17 @@ const WORKER_SRC = `onmessage = async (e) => {
     } else {
       const b = new Uint8Array(data), gz = b[0] === 0x1f && b[1] === 0x8b;
       const text = gz ? await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('gzip'))).text() : new TextDecoder().decode(data);
-      postMessage({ id, result: JSON.parse(text) });
+      const obj = JSON.parse(text), list = obj && Array.isArray(obj.strokes) ? obj.strokes : null;
+      if (list) {
+        obj.strokes = []; // keeps its place among the keys; filled in from the pieces
+        for (let i = 0; i < list.length;) {
+          let j = i, n = 0;
+          while (j < list.length && n < 20000) { const s = list[j++] || {}; n += 1 + (s.samples ? s.samples.length : 0) + (s.raw ? s.raw.length : 0) + (s.hover ? s.hover.length : 0); }
+          postMessage({ id, chunk: list.slice(i, j) });
+          i = j;
+        }
+      }
+      postMessage({ id, result: obj, chunked: !!list });
     }
   } catch (err) { postMessage({ id, error: String(err && err.message || err) }); }
 };`;
@@ -1116,12 +1257,15 @@ function inWorker(op, data) {
   }
   if (!bgWorker) return Promise.reject(new Error('no worker'));
   return new Promise((res, rej) => {
-    const id = ++bgSeq, w = bgWorker;
+    const id = ++bgSeq, w = bgWorker, chunks = [];
     const done = () => { w.removeEventListener('message', on); w.removeEventListener('error', bad); };
     const on = (e) => {
       if (e.data.id !== id) return;
+      if (e.data.chunk) { for (const s of e.data.chunk) chunks.push(s); return; } // each piece arrives as its own task
       done();
-      if (e.data.error) { const er = new Error(e.data.error); er.bad = true; rej(er); } else res(e.data.result);
+      if (e.data.error) { const er = new Error(e.data.error); er.bad = true; rej(er); return; }
+      if (e.data.chunked) e.data.result.strokes = chunks;
+      res(e.data.result);
     };
     const bad = (e) => { done(); bgWorker = null; rej(new Error(e.message || 'worker failed')); };
     w.addEventListener('message', on); w.addEventListener('error', bad);
@@ -1329,24 +1473,41 @@ function mergeData(lm, ls, le, remote) {
   return { meta, strokes, events, renames };
 }
 async function waitIdle() { while (S.active) await new Promise((r) => setTimeout(r, 200)); }
+/* The merge works on copies and takes its time (the page stays responsive); you can keep
+ * drawing meanwhile. It is applied only if the drawing did not change while it ran;
+ * otherwise it starts again from the new state (and after a few tries waits for the next sync). */
 async function applyRemote(id, remote, md5, fileId) {
-  if (S.meta && S.meta.id === id) await waitIdle();
-  const cur = S.meta && S.meta.id === id;
-  const lm = cur ? S.meta : await DB.get('drawings', id);
-  const ls = cur ? S.strokes : (await DB.strokes(id)).sort((a, b) => a.i - b.i);
-  const le = await DB.events(id);
-  const { meta, strokes, events, renames } = mergeData(lm, ls, le, remote);
-  strokes.forEach(normalizeStroke);
-  migrateFigures(meta, strokes);
-  computeErasure(strokes);
-  meta.erasure = 1;
-  meta.drive = { ...(lm.drive || {}), json: fileId, md5 };
-  await DB.replaceDrawing(meta, strokes, events);
-  if (S.meta && S.meta.id === id) {
-    const added = strokes.length - S.strokes.length;
-    S.meta = meta; S.strokes = strokes; S.redo = [];
-    repaint(); updateTools();
-    if (added > 0) toast(`Pulled ${added} stroke${added === 1 ? '' : 's'} from your other device.`);
+  for (let attempt = 0; ; attempt++) {
+    if (S.meta && S.meta.id === id) await waitIdle();
+    const cur = !!(S.meta && S.meta.id === id);
+    const lm = cur ? S.meta : await DB.get('drawings', id);
+    const rev0 = lm.rev || 0, n0 = cur ? S.strokes.length : 0;
+    const ls = (cur ? S.strokes : (await DB.strokes(id)).sort((a, b) => a.i - b.i)).map((st) => ({ ...st }));
+    const le = await DB.events(id);
+    await yieldNow();
+    const { meta, strokes, events } = mergeData({ ...lm }, ls, le, remote);
+    await yieldNow();
+    strokes.forEach(normalizeStroke);
+    migrateFigures(meta, strokes);
+    await computeErasureAsync(strokes);
+    meta.erasure = 1;
+    meta.drive = { ...(lm.drive || {}), json: fileId, md5 };
+    const still = cur ? S.meta === lm && (S.meta.rev || 0) === rev0 && S.strokes.length === n0 && !S.active && !S.loading
+      : !(S.meta && S.meta.id === id) && ((await DB.get('drawings', id)) || {}).rev === lm.rev;
+    if (!still) {
+      if (attempt < 2) continue;
+      throw new Error('The drawing changed while syncing. It will sync again shortly.');
+    }
+    // swap first (same task as the check), then write: anything drawn from now on is saved after this write
+    if (cur) {
+      const added = strokes.length - S.strokes.length;
+      S.meta = meta; S.strokes = strokes; S.redo = [];
+      const write = DB.replaceDrawing(meta, strokes, events);
+      repaint(); updateTools();
+      if (added > 0) toast(`Pulled ${added} stroke${added === 1 ? '' : 's'} from your other device.`);
+      await write;
+    } else await DB.replaceDrawing(meta, strokes, events);
+    return;
   }
 }
 async function importRemote(file) {
@@ -1356,7 +1517,7 @@ async function importRemote(file) {
   const meta = { ...m, format: FORMAT, rev: 0, synced_rev: 0, synced_at: file.modifiedTime, drive: { json: file.id, md5: file.md5Checksum }, view: null, stroke_count: strokes.length, erasure: 1 };
   strokes.sort((a, b) => a.i - b.i).forEach((st) => { st.drawing = meta.id; normalizeStroke(st); });
   migrateFigures(meta, strokes);
-  computeErasure(strokes);
+  await computeErasureAsync(strokes);
   events.forEach((e) => { e.drawing = meta.id; });
   await DB.replaceDrawing(meta, strokes, events);
   return meta.id;
@@ -1411,7 +1572,7 @@ async function connectDrive() {
   catch (err) { toast(err.message); updateDriveChip(); return false; }
 }
 function autoSync() {
-  if (Drive.ready() && navigator.onLine && !S.active && performance.now() - S.lastPen > 15000) syncAll(false);
+  if (Drive.ready() && navigator.onLine && !S.active && !S.loading && performance.now() - S.lastPen > 15000) syncAll(false);
   else updateDriveChip();
 }
 
@@ -2505,7 +2666,7 @@ function bindUI() {
   $('#setup-dlg').addEventListener('cancel', (e) => e.preventDefault());
 
   addEventListener('keydown', (e) => {
-    if (document.querySelector('dialog[open]') || (e.target.closest && e.target.closest('input,textarea,select'))) return;
+    if (S.loading || document.querySelector('dialog[open]') || (e.target.closest && e.target.closest('input,textarea,select'))) return;
     const k = e.key.toLowerCase(), mod = e.ctrlKey || e.metaKey;
     if (Replay.on) {
       if (k === ' ') { e.preventDefault(); Replay.playing ? Replay.pause() : Replay.play(); }
@@ -2542,6 +2703,7 @@ function bindUI() {
 
 async function startDrawing() {
   const last = localStorage.getItem('nh-last');
+  Loader.set(0, 'Opening storage');
   if (last && await DB.get('drawings', last)) await openDrawing(last);
   else await newDrawing(defaultPaper(), false, '');
 }
@@ -2579,21 +2741,23 @@ async function init() {
   bindUI();
   updateTools();
   setDiag(S.diag);
+  $('#ld-retry').onclick = () => location.reload();
+  $('#ld-new').onclick = () => { $('#ld-acts').hidden = true; newDrawing(defaultPaper(), false, ''); };
   try { await DB.open(); }
-  catch (err) { toast('This browser blocked local storage, so drawings cannot be saved: ' + err.message); return; }
+  catch (err) { Loader.fail('This browser blocked local storage, so drawings cannot be saved: ' + err.message); $('#ld-new').hidden = true; return; }
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   watchForUpdates();
   Drive.restore();
   updateDriveChip();
   setInterval(autoSync, 20000);
   S.device = loadDevice();
-  if (!S.device) { $('#setup-dlg').showModal(); return; }
+  if (!S.device) { Loader.hide(); $('#setup-dlg').showModal(); return; }
   S.ppmm = S.device.ppmm;
   await startDrawing();
 }
 
 // test hook (used by automated checks; harmless in normal use)
-window.__nh = { S, buildExport, undo, redo, togglePart, startPart, endPart, migrateFigures, partMembers, fit, Drive, syncAll, mergeData, Replay, Video };
+window.__nh = { S, openDrawing, Loader, applyRemote, buildExport, undo, redo, togglePart, startPart, endPart, migrateFigures, partMembers, fit, Drive, syncAll, mergeData, Replay, Video };
 
 init();
 })();
