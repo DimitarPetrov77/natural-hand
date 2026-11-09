@@ -8,7 +8,7 @@
 'use strict';
 (() => {
 
-const APP_VERSION = '0.5.1';
+const APP_VERSION = '0.6.1';
 const FORMAT = 'natural-hand/1';
 const SAMPLE_FIELDS = ['dt_ms','x_mm','y_mm','pressure','tiltX','tiltY','twist','altitude','azimuth','tangential','width_px','height_px','buttons'];
 const PAPERS = { A5: [148, 210], A4: [210, 297], A3: [297, 420], A2: [420, 594], A1: [594, 841], Square: [300, 300] };
@@ -29,8 +29,17 @@ const DEFAULT_PPMM = 96 / 25.4; // CSS nominal; calibration replaces it
 const $ = (s) => document.querySelector(s);
 const rnd = (v, d) => { const m = 10 ** d; return Math.round(v * m) / m; };
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-const absTime = (e) => performance.timeOrigin + e.timeStamp;
-const absNow = () => performance.timeOrigin + performance.now();
+/* Time. Pen events carry precise timestamps from the browser's monotonic clock, but on
+ * phones that clock stops while the device sleeps (screen locked). clockDrift adds back
+ * the time the clock missed, so stroke start times stay true wall-clock times and pauses
+ * across a locked screen have their real length. It is only updated between strokes. */
+let clockDrift = 0;
+function syncClock() {
+  const d = Date.now() - (performance.timeOrigin + performance.now());
+  if (Math.abs(d - clockDrift) > 5) clockDrift = d;
+}
+const absTime = (e) => performance.timeOrigin + e.timeStamp + clockDrift;
+const absNow = () => performance.timeOrigin + performance.now() + clockDrift;
 const uid = () => Math.random().toString(36).slice(2, 8);
 const pad2 = (n) => String(n).padStart(2, '0');
 
@@ -359,6 +368,7 @@ function erasedMask(st) {
   return mask;
 }
 // the drawable pieces of a stroke: a start dot and runs of points sharing one width
+let minLineMm = 0; // raised only while rendering video, so hairlines stay visible
 function strokeRuns(st, from = 0, to = st.samples.length, useMask = true) {
   const P = st.samples, n = Math.min(to, P.length), runs = [];
   let dot = null;
@@ -366,12 +376,12 @@ function strokeRuns(st, from = 0, to = st.samples.length, useMask = true) {
   const eraser = st.tool === 'eraser';
   const W = eraser || st.brush === 'technical' ? null : widthsOf(st);
   const M = eraser || !useMask ? null : erasedMask(st);
-  if (from === 0 && !(M && M[0])) dot = [P[0][1], P[0][2], (W ? W[0] : st.width_mm) / 2];
+  if (from === 0 && !(M && M[0])) dot = [P[0][1], P[0][2], Math.max(minLineMm, W ? W[0] : st.width_mm) / 2];
   const q = st.width_mm * 0.04;
   let run = null;
   for (let i = Math.max(1, from); i < n; i++) {
     if (M && (M[i] || M[i - 1])) { run = null; continue; }
-    const w = W ? Math.max(0.02, Math.round(((W[i - 1] + W[i]) / 2) / q) * q) : st.width_mm;
+    const w = Math.max(minLineMm, W ? Math.max(0.02, Math.round(((W[i - 1] + W[i]) / 2) / q) * q) : st.width_mm);
     if (!run || run.w !== w) { run = { w, pts: [[P[i - 1][1], P[i - 1][2]]] }; runs.push(run); }
     run.pts.push([P[i][1], P[i][2]]);
   }
@@ -565,6 +575,8 @@ function onDown(e) {
   touches.clear(); gesture = null;
   ensureSession();
   const eraserEnd = (e.buttons & 32) !== 0 || e.button === 5;
+  syncClock();
+  if (awayAt != null) awayEnd();
   const t0 = rnd(absTime(e), 3);
   const { h, dropped } = takeHover(t0);
   const st = {
@@ -858,6 +870,7 @@ async function buildExport(id) {
       coordinates: 'x_mm, y_mm in paper millimetres, origin at top-left of the sheet (on endless pages coordinates can be negative)',
       pressure_gamma: 'pressure feel of the device when drawn: width uses pressure ** pressure_gamma; recorded pressure is unchanged',
       prompt: 'id of the session prompt the stroke was drawn under (see prompts), or null',
+      time: 't0 and event times are wall-clock epoch ms, corrected for time the device slept; away_start / away_end events mark when the app was hidden (away_ms = length)',
       t0: 'stroke start, epoch milliseconds (high resolution)',
       dt_ms: 'milliseconds since the stroke t0; negative in hover (pen in the air before the stroke)',
       last_sample: 'the final sample of a stroke is the pen-up event (pressure 0) unless the stroke was cancelled',
@@ -1422,6 +1435,7 @@ function promptTick() {
   if (!p) { c.hidden = true; return; }
   const now = Date.now();
   if (p.ends && now >= p.ends) { endPrompt(true); return; }
+  if (p.paused) return;
   const ms = p.ends ? p.ends - now : now - p.started, t = Math.floor(ms / 1000);
   c.hidden = false;
   c.textContent = `${p.text}, ${Math.floor(t / 60)}:${pad2(t % 60)}${p.ends ? ' left' : ''}`;
@@ -1439,6 +1453,25 @@ function endPrompt(timeUp) {
   }
 }
 
+/* ------------------------------------------------------------ time away
+ * When the app is hidden (screen locked, another app opened) the data records it, so a
+ * pause for thought and leaving the drawing can be told apart. A session timer pauses too. */
+let awayAt = null;
+function awayStart() {
+  if (awayAt != null || !S.meta) return;
+  awayAt = absNow();
+  logEvent('away_start');
+  if (S.prompt && S.prompt.ends) { S.prompt.remaining = S.prompt.ends - Date.now(); S.prompt.ends = null; S.prompt.paused = true; }
+}
+function awayEnd() {
+  syncClock();
+  if (awayAt == null) return;
+  const ms = Math.max(0, absNow() - awayAt);
+  awayAt = null;
+  logEvent('away_end', { away_ms: Math.round(ms) });
+  if (S.prompt && S.prompt.paused) { S.prompt.ends = Date.now() + S.prompt.remaining; S.prompt.paused = false; promptTick(); }
+}
+
 /* ------------------------------------------------------------ pressure feel */
 const gammaFromFeel = (v) => rnd(Math.pow(2, (1.5 * v) / 100), 4);
 const feelFromGamma = (g) => Math.round((Math.log2(g || 1) / 1.5) * 100);
@@ -1447,6 +1480,184 @@ function drawFeelCurve() {
   for (let i = 0; i <= 24; i++) { const p = i / 24; pts.push(`${(p * 100).toFixed(1)},${(60 - Math.pow(p, g) * 60).toFixed(1)}`); }
   $('#feel-curve').setAttribute('points', pts.join(' '));
 }
+
+
+/* ------------------------------------------------------------ replay video (MP4)
+ * Frames are drawn one by one from the stroke data at the chosen size (not screen-
+ * recorded), encoded with the browser's video encoder (WebCodecs) and packed into
+ * an MP4 by the bundled mp4-muxer library. Faster than real time on most devices. */
+const VIDEO_HOLD_START = 0.5, VIDEO_HOLD_END = 2.5; // seconds of still page before and after
+const Video = {
+  busy: false, cancel: false, file: null,
+  shapeOf(rect) {
+    const v = $('#v-shape').value;
+    if (v === 'page') return rect.w / rect.h;
+    const [a, b] = v.split(':').map(Number);
+    return a / b;
+  },
+  // what the video frames show (doc mm), the white paper inside it, and the frame size
+  plan() {
+    const meta = S.meta, strokes = S.strokes;
+    const endless = !!meta.paper.endless;
+    const content = endless ? (contentBox(strokes, 8) || { x0: 0, y0: 0, w: 100, h: 100 }) : { x0: 0, y0: 0, w: meta.paper.w_mm, h: meta.paper.h_mm };
+    const aspect = this.shapeOf(content);
+    const short = Number($('#v-res').value);
+    let W = aspect >= 1 ? short * aspect : short, H = aspect >= 1 ? short : short / aspect;
+    const even = (v) => Math.max(2, Math.round(v / 2) * 2);
+    W = even(W); H = even(H);
+    const pad = $('#v-shape').value === 'page' ? 0 : 0.06;
+    const K = Math.min((W * (1 - 2 * pad)) / content.w, (H * (1 - 2 * pad)) / content.h);
+    const b = { x0: content.x0 + content.w / 2 - W / (2 * K), y0: content.y0 + content.h / 2 - H / (2 * K), w: W / K, h: H / K };
+    const fps = Number($('#v-fps').value);
+    const bitrate = Math.round(W * H * fps * Number($('#v-q').value));
+    return { W, H, K, b, paperRect: content, fps, bitrate, short };
+  },
+  engine(plan, ctx) {
+    const eng = Object.create(Replay);
+    Object.assign(eng, {
+      strokes: S.strokes.filter((st) => st.samples.length).slice().sort((a, c) => a.t0 - c.t0),
+      events: this.events, sessions: new Map(), skip: $('#v-skip').checked,
+      items: [], toggles: [], hidden: new Set(), k: 0, partial: 0, ti: 0, t: 0,
+      paper: { x: ctx, K: plan.K, b: plan.b },
+      ui() {},
+      clear() {
+        const { K, b } = plan, bg = $('#v-bg').value, pr = plan.paperRect;
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.fillStyle = bg; ctx.fillRect(0, 0, plan.W, plan.H);
+        ctx.setTransform(K, 0, 0, K, -b.x0 * K, -b.y0 * K);
+        ctx.fillStyle = '#ffffff'; ctx.fillRect(pr.x0, pr.y0, pr.w, pr.h);
+      },
+    });
+    eng.build();
+    return eng;
+  },
+  speedFor(total) {
+    const v = $('#v-len').value;
+    if (v.startsWith('x')) return Number(v.slice(1));
+    const target = Number(v.slice(3)) - VIDEO_HOLD_START - VIDEO_HOLD_END;
+    return Math.max(1, total / (Math.max(1, target) * 1000));
+  },
+  async info() {
+    if (!S.meta) return;
+    const p = this.plan();
+    const eng = this.engine(p, document.createElement('canvas').getContext('2d'));
+    const speed = this.speedFor(eng.total);
+    const secs = eng.total / speed / 1000 + VIDEO_HOLD_START + VIDEO_HOLD_END;
+    const mb = (p.bitrate * secs) / 8 / 1048576;
+    const t = Math.round(secs);
+    $('#v-info').textContent = `${p.W} × ${p.H}, ${Math.floor(t / 60)}:${pad2(t % 60)} long at ${speed < 10 ? speed.toFixed(1) : Math.round(speed)}× speed, at most about ${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB.`;
+  },
+  async open() {
+    if (!S.meta) return;
+    if (!S.strokes.some((st) => st.samples.length)) { toast('Nothing to make a video of yet.'); return; }
+    if (!('VideoEncoder' in window)) { toast('This browser cannot make videos. Use Chrome on Android or a desktop.'); return; }
+    if (Replay.on) Replay.pause();
+    if ($('#menu').open) $('#menu').close();
+    this.events = (await DB.events(S.meta.id)).filter((e) => e.type === 'undo' || e.type === 'redo').sort((a, b) => a.t - b.t);
+    this.file = null;
+    $('#v-share').hidden = true; $('#v-save').hidden = true; $('#v-go').hidden = false;
+    $('#v-prog').hidden = true; $('#v-status').textContent = '';
+    for (const el of document.querySelectorAll('#video-dlg select, #video-dlg input')) el.disabled = false;
+    $('#video-dlg').showModal();
+    this.info();
+  },
+  async pickCodec(W, H, fps, bitrate) {
+    const tries = [
+      ['avc', 'avc1.640034'], ['avc', 'avc1.640033'], ['avc', 'avc1.640028'], ['avc', 'avc1.4d0033'], ['avc', 'avc1.42003e'],
+      ['vp9', 'vp09.00.51.08'], ['vp9', 'vp09.00.41.08'], ['av1', 'av01.0.12M.08'],
+    ];
+    for (const [mux, codec] of tries) {
+      const cfg = { codec, width: W, height: H, bitrate, framerate: fps, latencyMode: 'quality' };
+      if (mux === 'avc') cfg.avc = { format: 'avc' };
+      try { const r = await VideoEncoder.isConfigSupported(cfg); if (r.supported) return { mux, cfg }; } catch {}
+    }
+    return null;
+  },
+  loadMuxer() {
+    if (window.Mp4Muxer) return Promise.resolve();
+    return new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = 'vendor/mp4-muxer.js';
+      s.onload = () => res(); s.onerror = () => rej(new Error('Could not load the video packer. Check the connection once, then it works offline.'));
+      document.head.appendChild(s);
+    });
+  },
+  async make() {
+    if (this.busy) return;
+    this.busy = true; this.cancel = false;
+    const status = (t) => { $('#v-status').textContent = t; };
+    const prog = $('#v-prog');
+    for (const el of document.querySelectorAll('#video-dlg select, #video-dlg input')) el.disabled = true;
+    $('#v-go').hidden = true; prog.hidden = false; prog.value = 0;
+    let wake = null;
+    try { if (navigator.wakeLock) wake = await navigator.wakeLock.request('screen'); } catch {}
+    try {
+      await this.loadMuxer();
+      const p = this.plan();
+      const codec = await this.pickCodec(p.W, p.H, p.fps, p.bitrate);
+      if (!codec) throw new Error('This device cannot encode video at this size. Try a lower resolution.');
+      const ink = document.createElement('canvas'); ink.width = p.W; ink.height = p.H;
+      const ictx = ink.getContext('2d');
+      const out = document.createElement('canvas'); out.width = p.W; out.height = p.H;
+      const octx = out.getContext('2d', { alpha: false });
+      const eng = this.engine(p, ictx);
+      const speed = this.speedFor(eng.total);
+      const drawFrames = Math.ceil((eng.total / speed / 1000) * p.fps);
+      const holdA = Math.round(VIDEO_HOLD_START * p.fps), holdB = Math.round(VIDEO_HOLD_END * p.fps);
+      const frames = holdA + drawFrames + 1 + holdB;
+      const target = new Mp4Muxer.ArrayBufferTarget();
+      const muxer = new Mp4Muxer.Muxer({ target, video: { codec: codec.mux, width: p.W, height: p.H, frameRate: p.fps }, fastStart: 'in-memory', firstTimestampBehavior: 'offset' });
+      let encErr = null;
+      const enc = new VideoEncoder({ output: (chunk, meta) => muxer.addVideoChunk(chunk, meta), error: (e) => { encErr = e; } });
+      enc.configure(codec.cfg);
+      const cursor = $('#v-cursor').checked, ks = (p.K * 720) / p.short;
+      minLineMm = $('#v-thin').checked ? (1.4 * p.short) / 1080 / p.K : 0;
+      eng.seek(0);
+      for (let f = 0; f < frames; f++) {
+        if (this.cancel) throw new Error('cancelled');
+        if (encErr) throw encErr;
+        const tau = f < holdA ? 0 : Math.min(eng.total, ((f - holdA) / p.fps) * 1000 * speed);
+        eng.t = tau; eng.advance(tau); eng.t = tau;
+        octx.setTransform(1, 0, 0, 1, 0, 0);
+        octx.drawImage(ink, 0, 0);
+        if (cursor && f >= holdA && tau < eng.total) {
+          octx.setTransform(p.K, 0, 0, p.K, -p.b.x0 * p.K, -p.b.y0 * p.K);
+          eng.drawCursor(octx, ks);
+        }
+        const frame = new VideoFrame(out, { timestamp: Math.round((f * 1e6) / p.fps), duration: Math.round(1e6 / p.fps) });
+        enc.encode(frame, { keyFrame: f % (p.fps * 2) === 0 });
+        frame.close();
+        if (enc.encodeQueueSize > 6) await new Promise((r) => enc.addEventListener('dequeue', r, { once: true }));
+        if (f % 15 === 0) {
+          prog.value = f / frames;
+          status(`Making the video, ${Math.round((f / frames) * 100)}%`);
+          await new Promise((r) => setTimeout(r));
+        }
+      }
+      status('Finishing…');
+      await enc.flush();
+      enc.close();
+      muxer.finalize();
+      prog.value = 1;
+      const name = `${fileBase()}-replay.mp4`;
+      this.file = new File([target.buffer], name, { type: 'video/mp4' });
+      const mb = this.file.size / 1048576;
+      status(`Ready: ${name}, ${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB, ${codec.mux === 'avc' ? 'H.264' : codec.mux.toUpperCase()}.`);
+      $('#v-save').hidden = false;
+      let canShare = false;
+      try { canShare = !!(navigator.canShare && navigator.canShare({ files: [this.file] })); } catch {}
+      $('#v-share').hidden = !canShare;
+      download(name, this.file);
+    } catch (err) {
+      status(err.message === 'cancelled' ? 'Stopped.' : `Could not make the video: ${err.message}`);
+      $('#v-go').hidden = false;
+      for (const el of document.querySelectorAll('#video-dlg select, #video-dlg input')) el.disabled = false;
+    } finally {
+      this.busy = false; minLineMm = 0;
+      if (wake) wake.release().catch(() => {});
+    }
+  },
+};
 
 /* ------------------------------------------------------------ diagnostics */
 const Diag = {
@@ -1757,6 +1968,14 @@ function bindUI() {
   $('#m-feel').oninput = () => drawFeelCurve();
   $('#m-feel').onchange = (e) => { S.device.pressure_gamma = gammaFromFeel(Number(e.target.value)); saveDevice(S.device); toast('Pressure feel saved for this device. It applies to new strokes.'); };
   $('#m-replay').onclick = () => Replay.open();
+  $('#m-video').onclick = () => Video.open();
+  $('#rp-video').onclick = () => Video.open();
+  for (const id of ['#v-shape', '#v-res', '#v-len', '#v-fps', '#v-q', '#v-skip']) $(id).addEventListener('change', () => Video.info());
+  $('#v-go').onclick = () => Video.make();
+  $('#v-save').onclick = () => Video.file && download(Video.file.name, Video.file);
+  $('#v-share').onclick = async () => { try { await navigator.share({ files: [Video.file], title: S.meta.title || 'Drawing' }); } catch (err) { if (err.name !== 'AbortError') toast(err.message); } };
+  $('#v-cancel').onclick = () => { if (Video.busy) Video.cancel = true; else $('#video-dlg').close(); };
+  $('#video-dlg').addEventListener('cancel', (e) => { if (Video.busy) { e.preventDefault(); Video.cancel = true; } });
   $('#m-image').onclick = () => { $('#menu').close(); openExport(); };
   $('#m-prompt').onclick = () => { $('#prompt-dlg').showModal(); };
   $('#x-format').onchange = updateExportInfo;
@@ -1834,7 +2053,10 @@ function bindUI() {
   addEventListener('keyup', (e) => { if (e.key === ' ') { spaceDown = false; view.style.cursor = ''; } });
   addEventListener('resize', () => { resize(); hideNibs(); });
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { readSurround(); invalidateSharp(); requestRender(); });
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushMeta(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') { flushMeta(); awayStart(); }
+    else awayEnd();
+  });
   addEventListener('pagehide', () => flushMeta());
   addEventListener('online', () => autoSync());
 }
@@ -1846,6 +2068,7 @@ async function startDrawing() {
 }
 
 async function init() {
+  syncClock();
   readSurround();
   resize();
   buildRail();
@@ -1872,7 +2095,7 @@ async function init() {
 }
 
 // test hook (used by automated checks; harmless in normal use)
-window.__nh = { S, buildExport, undo, redo, toggleFigure, fit, Drive, syncAll, mergeData, Replay };
+window.__nh = { S, buildExport, undo, redo, toggleFigure, fit, Drive, syncAll, mergeData, Replay, Video };
 
 init();
 })();

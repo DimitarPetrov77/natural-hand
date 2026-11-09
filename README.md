@@ -60,6 +60,7 @@ Then open the menu, turn on **Show live pen data**, and draw a few lines. The pa
 | Fit page | fit button | 0 |
 | Life size (1:1) | zoom chip at the top | L |
 | Replay | menu, Replay | R, then Space to pause, Esc to close |
+| Replay video | menu, Export video | |
 | Live pen data | menu | D |
 
 Finger touches are ignored for a moment after the pen was near the screen, so a resting palm does not move the page. You can switch finger navigation off in the menu.
@@ -76,6 +77,8 @@ Undo never deletes data: undone strokes stay in the file, marked with the time t
 
 **Replay.** Menu, Replay. The drawing redraws itself in the order and at the speed you made it, with a cursor where the pen was, including where it hovered. Erasing and undo happen when they happened. Skip pauses shortens breaks longer than 1.5 seconds; turn it off to see real time. You can zoom and move the page while it plays.
 
+**Export video.** Menu, Export video, or the button in the replay bar. The replay is drawn frame by frame from your stroke data at the size you choose, not recorded from the screen, so lines stay sharp. Choose the shape (same as the page, 9:16 for Reels and Shorts, 4:5, square, 16:9), resolution up to 4K, length (fit into 15 s, 30 s, 1 min, 3 min, or a fixed speed), frame rate, quality, and whether to show the pen and skip pauses. The result is an MP4 (H.264 where the device supports it) that downloads, and on Android can be shared directly. It works offline; the MP4 packing uses the bundled mp4-muxer library (MIT licence, in `vendor/`).
+
 **Export image.** Menu, Export image: PNG at 150, 300 or 600 dpi, or SVG with real millimetre sizes for Illustrator or Inkscape, with a white or transparent background. On Android you can share it directly. Endless pages are cropped to the ink.
 
 **Sessions.** Menu, Start a session: pick a prompt (figures only, fast gestures, your own) and a time. Every stroke drawn during it carries the session, and a timer shows at the top. When time is up the phone buzzes and the session ends; you can keep drawing.
@@ -87,6 +90,8 @@ Undo never deletes data: undone strokes stay in the file, marked with the time t
 **Eraser.** It is always as wide as the pen and has one choice, in the width button while the eraser is on: **Whole lines** deletes every line it touches, exactly as the line was recorded; **Cut through** removes only the parts it passes over. Either way the ink is marked as erased in the data (`erased`) and left out of the final drawing, undoing the eraser brings it back, and the eraser strokes stay in the file as part of how you work.
 
 **Smoothing.** It changes the recorded line, not just the screen: `samples` holds the smoothed path you see. When smoothing is above 0, the unsmoothed device samples are kept next to it as `raw`, so nothing about your real movement is lost. Smoothing is time-based, so a level feels the same on the Wacom, the tablet and the phone.
+
+**Time away.** Stroke times are real clock times. When you lock the screen or switch apps, the data records `away_start` and `away_end` (with how long you were gone), so a pause to think and a break can be told apart. A session timer pauses while you are away. Phones stop their precise clock while asleep; the app corrects for that, so a 20-minute break shows as 20 minutes.
 
 ## 6. Data format
 
@@ -108,7 +113,7 @@ One file per drawing: `<id>.json.gz` in Drive (plain `<id>.json` from Download J
       "undone_at", "cancelled"
   } ],
   "prompts": [ { "id", "text", "minutes", "started", "ended" } ],
-  "events": [ { "t", "type": "undo" | "redo" | "figure_start" | "figure_end" | "fill_start" | "fill_end" | "prompt_start" | "prompt_end", ... } ]
+  "events": [ { "t", "type": "undo" | "redo" | "figure_start" | "figure_end" | "fill_start" | "fill_end" | "prompt_start" | "prompt_end" | "away_start" | "away_end", ... } ]
 }
 ```
 

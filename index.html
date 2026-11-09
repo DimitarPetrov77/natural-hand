@@ -125,6 +125,8 @@
   #rp-time{font-variant-numeric:tabular-nums;font-size:.9rem;min-width:7.5em}
   #rp-info{font-size:.82rem;color:var(--muted);flex:1 1 100%;order:9}
   #rp-play{min-width:6.5em}
+  #video-dlg progress{width:100%;height:8px;accent-color:var(--ink)}
+  #video-dlg progress[hidden],#video-dlg [hidden]{display:none}
   .feel{display:grid;gap:4px}
   .feel label{font-size:.9rem}
   .feel svg{width:100%;height:60px;border:1px solid var(--line);border-radius:8px;background:transparent}
@@ -194,6 +196,7 @@
     <div class="row">
       <button class="btn" id="m-replay">Replay</button>
       <button class="btn" id="m-image">Export image</button>
+      <button class="btn" id="m-video">Export video</button>
       <button class="btn" id="m-export">Download data (JSON)</button>
     </div>
     <div class="sep"></div>
@@ -320,6 +323,51 @@
   </div>
 </dialog>
 
+<dialog id="video-dlg">
+  <div class="sheet">
+    <h2>Export replay video</h2>
+    <label>Shape
+      <select id="v-shape">
+        <option value="page">Same as the page</option>
+        <option value="9:16">Vertical 9:16, for Reels, Shorts and Stories</option>
+        <option value="4:5">Portrait 4:5, for an Instagram post</option>
+        <option value="1:1">Square 1:1</option>
+        <option value="16:9">Horizontal 16:9, for YouTube</option>
+      </select>
+    </label>
+    <label>Resolution
+      <select id="v-res"><option value="720">720p</option><option value="1080" selected>1080p, full HD</option><option value="1440">1440p</option><option value="2160">2160p, 4K</option></select>
+    </label>
+    <label>Length
+      <select id="v-len">
+        <option value="fit15">Fit into 15 seconds</option><option value="fit30" selected>Fit into 30 seconds</option><option value="fit60">Fit into 1 minute</option><option value="fit180">Fit into 3 minutes</option>
+        <option value="x1">Real speed</option><option value="x2">2× speed</option><option value="x4">4× speed</option><option value="x8">8× speed</option><option value="x16">16× speed</option><option value="x32">32× speed</option><option value="x64">64× speed</option>
+      </select>
+    </label>
+    <label>Frame rate
+      <select id="v-fps"><option value="24">24 per second, film look</option><option value="30" selected>30 per second</option><option value="60">60 per second, smoothest</option></select>
+    </label>
+    <label>Quality
+      <select id="v-q"><option value="0.05">Standard, smaller file</option><option value="0.1" selected>High</option><option value="0.2">Maximum, larger file</option></select>
+    </label>
+    <label>Background around the page
+      <select id="v-bg"><option value="#ffffff">White</option><option value="#262523">Dark</option></select>
+    </label>
+    <label class="check"><input type="checkbox" id="v-skip" checked> Skip pauses</label>
+    <label class="check"><input type="checkbox" id="v-cursor" checked> Show the pen</label>
+    <label class="check"><input type="checkbox" id="v-thin" checked> Keep thin lines visible on phone screens</label>
+    <p id="v-info"></p>
+    <progress id="v-prog" max="1" value="0" hidden></progress>
+    <p id="v-status" role="status"></p>
+    <div class="row">
+      <button class="btn primary" id="v-go">Make video</button>
+      <button class="btn primary" id="v-save" hidden>Download again</button>
+      <button class="btn" id="v-share" hidden>Share</button>
+      <button class="btn" id="v-cancel">Close</button>
+    </div>
+  </div>
+</dialog>
+
 <div id="replay-bar" hidden>
   <button class="btn primary" id="rp-play">Pause</button>
   <input type="range" id="rp-seek" min="0" max="1000" step="1" aria-label="Position in the replay">
@@ -329,6 +377,7 @@
   </select>
   <label class="check"><input type="checkbox" id="rp-skip" checked> Skip pauses</label>
   <span id="rp-info"></span>
+  <button class="btn" id="rp-video">Export video</button>
   <button class="btn" id="rp-close">Close</button>
 </div>
 
