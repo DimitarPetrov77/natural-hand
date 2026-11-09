@@ -120,7 +120,7 @@ def analyse(files):
         for st in order:
             raw = st.raw if st.cancelled else st.raw[:-1]   # last row is the pen-up event
             end = st.t0 + float(st.raw[-1, 0])
-            white = st.tool == "eraser"
+            white = st.tool == "eraser" or st.ink == "white"   # cut-through eraser or white pen: both draw in white
             sh.cancelled += st.cancelled
             if not st.undone and not st.cancelled and len(raw):
                 dev = dev_of.get(st.session, "?")
@@ -162,7 +162,7 @@ def analyse(files):
             if len(raw):
                 prev = (end, raw[-1, 1:3])
         # pictures: the drawn (smoothed) path as it ended up on the page, erased parts removed
-        vis = [s for s in order if s.tool != "eraser" and not s.undone and not s.cancelled]
+        vis = [s for s in order if s.tool != "eraser" and not s.undone and not s.cancelled]   # white pen lines included, painted white
         rank = {s.i: k for k, s in enumerate(vis)}
         x0 = y0 = math.inf; x1 = y1 = -math.inf
         for s in vis:
@@ -170,7 +170,7 @@ def analyse(files):
                 if not len(seg):
                     continue
                 seg = seg[:, 1:3]
-                sh.paths.append((rank[s.i] / max(1, len(vis)), s.width_mm, path_data(seg.tolist())))
+                sh.paths.append((rank[s.i] / max(1, len(vis)), s.width_mm, path_data(seg.tolist()), s.ink == "white"))
                 x0 = min(x0, seg[:, 0].min()); x1 = max(x1, seg[:, 0].max())
                 y0 = min(y0, seg[:, 1].min()); y1 = max(y1, seg[:, 1].max())
         if x0 < math.inf:   # cropped to the drawing, with a little paper around it
@@ -420,8 +420,9 @@ def sheet_pictures(sh, idx):
     x0, y0, w, h = sh.box
     nb = 8
     groups = [[] for _ in range(nb)]
-    for order, wd, d in sh.paths:
-        groups[min(nb - 1, int(order * nb))].append(f'<path d="{d}" stroke-width="{max(wd, 0.12):.2f}"/>')
+    for order, wd, d, wh in sh.paths:
+        st_ = ' style="stroke:var(--wm)"' if wh else ""
+        groups[min(nb - 1, int(order * nb))].append(f'<path d="{d}" stroke-width="{max(wd, 0.12):.2f}"{st_}/>')
     defs = "".join(f'<g id="d{idx}b{k}">{"".join(gp)}</g>' for k, gp in enumerate(groups))
     vb = f'{x0:.1f} {y0:.1f} {w:.1f} {h:.1f}'
     frames = []
@@ -541,7 +542,7 @@ def report(files, lines, sheets, rates, galleries, white_gallery):
             tip = f"White {CLASSES[l.cls][0].lower().rstrip('s')}: {g(l.length, 'mm')}, {l.width:g} mm wide, {g(l.dur, 'ms')}, pressure {g(l.pressure, '', 2)}"
             cells.append(f'<svg class="cell neg" viewBox="{cx - size / 2:.3f} {cy - size / 2:.3f} {size:.3f} {size:.3f}" data-tip="{esc(tip)}" role="img" aria-label="{esc(tip)}">'
                          f'<path d="{path_data(seg.tolist(), step=size / 200)}" style="stroke-width:{max(l.width, size / 60):.3f}"/></svg>')
-        body.append(f'<section><h2>White marks</h2><p class="lead">{len(whites):,} marks made with the eraser, cutting white into the ink: '
+        body.append(f'<section><h2>White marks</h2><p class="lead">{len(whites):,} white marks, made with the white pen or by cutting through the ink with the eraser: '
                     f'drawing in white, not corrections. Made in {len(spans)} stretch{"es" * (len(spans) != 1)}: {esc(", ".join(spans))}.</p>'
                     + table(["Mark", "Marks", "Share", "Pen down", "Peak speed", "Pressure", "Widths"], rows, "num")
                     + '<p class="note">Medians. Sizes are sorted by the same lengths as ink lines.</p>'
@@ -674,7 +675,7 @@ rect.s4,.sw.s4{fill:var(--s4);background:var(--s4)} rect.s5,.sw.s5{fill:var(--s5
 .cell path{fill:none;stroke:var(--pen);stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke}
 .frames{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(46%,200px),1fr));gap:12px}
 .frame figcaption{margin:4px 0 0}
-.paper{fill:var(--paper)} .paper2{fill:var(--tpaper)} .ink.old{stroke:#b9b6ae}
+.paper{fill:var(--paper)} .paper2{fill:var(--tpaper)} .frame svg{--wm:var(--paper)} .tmap svg{--wm:var(--tpaper)} .ink.old{stroke:#b9b6ae}
 .ink,.tink{fill:none;stroke-linecap:round;stroke-linejoin:round} .ink{stroke:var(--pen)}
 .frame svg,.tmap svg{border-radius:4px;box-shadow:0 0 0 1px var(--line)}
 .tmap{max-width:520px}

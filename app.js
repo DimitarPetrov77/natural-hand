@@ -8,7 +8,7 @@
 'use strict';
 (() => {
 
-const APP_VERSION = '0.7.1';
+const APP_VERSION = '0.8.0';
 const FORMAT = 'natural-hand/1';
 const SAMPLE_FIELDS = ['dt_ms','x_mm','y_mm','pressure','tiltX','tiltY','twist','altitude','azimuth','tangential','width_px','height_px','buttons'];
 const PAPERS = { A5: [148, 210], A4: [210, 297], A3: [297, 420], A2: [420, 594], A1: [594, 841], Square: [300, 300] };
@@ -148,6 +148,7 @@ const S = {
   width: 0.3,
   eraseMode: 'stroke',     // 'stroke' deletes whole lines, 'cut' cuts through them
   brush: 'technical',
+  ink: 'black',        // 'black' or 'white': white ink paints over what is below, in drawing order
   smoothing: 0,
   partStack: [],       // ids of the parts open while drawing, outermost first
   kind: localStorage.getItem('nh-kind') || 'Figure', // kind the part button starts
@@ -349,7 +350,10 @@ function maybeExtend() {
 }
 // a whole-line eraser shows a light trail while you drag; a cutting eraser paints white
 const eraseModeOf = (st) => st.erase_mode || 'cut';
-function inkOf(st) { return st.tool !== 'eraser' ? '#000000' : eraseModeOf(st) === 'stroke' ? '#a4dded' : '#ffffff'; }
+function inkOf(st) {
+  if (st.tool !== 'eraser') return st.ink === 'white' ? '#ffffff' : '#000000';
+  return eraseModeOf(st) === 'stroke' ? '#a4dded' : '#ffffff';
+}
 /* Smoothing: `raw` keeps exactly what the device reported; `samples` is the smoothed
  * path that is drawn and analysed. Positions pass through a time-based exponential
  * filter (time constant smoothing_tau_ms), so a level feels the same on every device.
@@ -600,8 +604,8 @@ function paintAll(ctx, strokes, b, K, bg = '#ffffff') {
   for (const st of strokes) if (visibleInk(st)) drawStroke(ctx, st);
 }
 /* Full repaint of the page bitmap. Big drawings take a while, so it runs in slices
- * of about 12 ms and the app stays responsive (the drawing appears in order). Live
- * ink and region repaints during a slow repaint are fine: finished ink is all black. */
+ * of about 12 ms and the app stays responsive (the drawing appears in order). Lines
+ * drawn meanwhile are painted again at the end, so white over black stays in order. */
 let paintGen = 0, painting = false;
 const yieldNow = () => new Promise((r) => setTimeout(r, 0));
 // resolves when the page is fully painted (or a newer repaint took over)
@@ -619,7 +623,12 @@ function repaint(onProgress) {
       x.setTransform(K, 0, 0, K, -b.x0 * K, -b.y0 * K);
       while (i < list.length && performance.now() < end) { const st = list[i++]; if (visibleInk(st)) drawStroke(x, st); }
       if (onProgress) onProgress(list.length ? i / list.length : 1);
-      if (i < list.length) setTimeout(slice, 0); else { painting = false; done(true); }
+      if (i < list.length) { setTimeout(slice, 0); }
+      else {
+        // lines drawn while this ran were painted before older lines reached the page; with white ink order matters
+        for (const st of S.strokes.slice(list.length)) if (visibleInk(st)) drawStroke(x, st);
+        painting = false; done(true);
+      }
       invalidateSharp();
       if (!S.loading) requestRender(); // behind the loading screen the view is shown once, at the end
     };
@@ -752,6 +761,7 @@ function onDown(e) {
     eraser_end: eraserEnd,
     width_mm: S.width,
     brush: eraserEnd || S.tool === 'eraser' ? null : S.brush,
+    ink: eraserEnd || S.tool === 'eraser' ? undefined : S.ink,
     erase_mode: eraserEnd || S.tool === 'eraser' ? S.eraseMode : undefined,
     smoothing: eraserEnd || S.tool === 'eraser' ? 0 : S.smoothing,
     smoothing_tau_ms: eraserEnd || S.tool === 'eraser' ? 0 : tauFor(S.smoothing),
@@ -923,6 +933,13 @@ function setNib(w) { S.width = w; localStorage.setItem('nh-nib', String(w)); upd
 function setEraseMode(m) { S.eraseMode = m === 'cut' ? 'cut' : 'stroke'; localStorage.setItem('nh-erase-mode', S.eraseMode); updateTools(); }
 function setBrush(b) { if (BRUSHES[b]) { S.brush = b; localStorage.setItem('nh-brush', b); if (S.tool === 'eraser') { S.tool = 'pen'; buildNibs(); } updateTools(); } }
 function setSmoothing(v) { S.smoothing = clamp(Math.round(v), 0, 100); localStorage.setItem('nh-smooth', String(S.smoothing)); updateTools(); }
+function setInk(ink) {
+  S.ink = ink === 'white' ? 'white' : 'black';
+  localStorage.setItem('nh-ink', S.ink);
+  if (S.tool === 'eraser') { S.tool = 'pen'; buildNibs(); }
+  updateTools();
+}
+function toggleInk() { setInk(S.tool === 'pen' && S.ink === 'white' ? 'black' : 'white'); }
 function toggleEraser() { S.tool = S.tool === 'eraser' ? 'pen' : 'eraser'; buildNibs(); updateTools(); }
 /* ------------------------------------------------------------ parts
  * A part is a group of strokes that make one thing: a figure, a head, a structure, a shell.
@@ -1175,6 +1192,7 @@ async function buildExport(id) {
       samples: 'the drawn path: positions smoothed with an exponential filter (time constant smoothing_tau_ms); all other columns as reported by the device',
       raw: 'present when smoothing_tau_ms > 0: the unsmoothed device samples, same columns; absent means samples are raw',
       brush: 'technical (constant width), ink (width from pressure, mild), brush (width from pressure, strong); width_mm is the nominal width',
+      ink: 'on pen strokes: "black" or "white" (absent means black). White ink paints over what was drawn before it; later lines paint over it. White marks are drawing, not corrections',
       parts: 'on strokes: ids of every part (figure, head, structure...) the stroke belongs to. In the drawing, parts = {id: {kind, parent, source, session, created, removed_at?}}: kind is the artist\'s word for the thing, parent the part it sits inside, source "live" (marked while drawing), "replay" (labelled afterwards) or "figure" (a figure from before parts existed). Parts with removed_at were taken back and should be ignored',
       figure: 'older strokes only: the figure number from before parts existed; the same strokes are in part "fig-N"',
       erased: '[[first_sample, last_sample, eraser_stroke_i], ...] parts of this stroke removed by later eraser strokes; the final drawing omits them',
@@ -1613,8 +1631,9 @@ function svgOf(meta, strokes, transparent) {
   for (const st of strokes) {
     if (st.undone_at || st.tool === 'eraser') continue;
     const { dot, runs } = strokeRuns(st);
-    if (dot) out.push(`<circle cx="${f(dot[0])}" cy="${f(dot[1])}" r="${f(dot[2])}" fill="#000000" stroke="none"/>`);
-    for (const r of runs) out.push(`<path stroke-width="${f(r.w)}" d="M${r.pts.map((q) => `${f(q[0])} ${f(q[1])}`).join('L')}"/>`);
+    const c = st.ink === 'white' ? '#ffffff' : null, sc = c ? ` stroke="${c}"` : '';
+    if (dot) out.push(`<circle cx="${f(dot[0])}" cy="${f(dot[1])}" r="${f(dot[2])}" fill="${c || '#000000'}" stroke="none"/>`);
+    for (const r of runs) out.push(`<path${sc} stroke-width="${f(r.w)}" d="M${r.pts.map((q) => `${f(q[0])} ${f(q[1])}`).join('L')}"/>`);
   }
   out.push('</g>', '</svg>');
   return out.join('\n');
@@ -2336,8 +2355,11 @@ function updateTools() {
   const glyph = er ? `<line x1="5" y1="10" x2="19" y2="10" stroke="currentColor" stroke-linecap="round" stroke-dasharray="2 3" stroke-width="${sw}"/>`
     : BRUSH_ICON[S.brush].replace('W', S.brush === 'technical' ? sw : Math.max(0.5, sw / 3));
   nb.innerHTML = `<svg viewBox="0 0 24 24">${glyph}</svg><span>${w}</span>`;
+  const white = !er && S.ink === 'white';
+  nb.classList.toggle('white', white);
+  for (const b of document.querySelectorAll('#ink-seg button')) b.setAttribute('aria-pressed', String(!er && b.dataset.ink === S.ink));
   for (const b of document.querySelectorAll('#brush-seg button')) b.setAttribute('aria-pressed', String(!er && b.dataset.b === S.brush));
-  nb.setAttribute('aria-label', er ? `Eraser, ${S.eraseMode === 'cut' ? 'cuts through lines' : 'deletes whole lines'}` : `Pen width ${w} mm, smoothing ${S.smoothing}`);
+  nb.setAttribute('aria-label', er ? `Eraser, ${S.eraseMode === 'cut' ? 'cuts through lines' : 'deletes whole lines'}` : `${white ? 'White' : 'Black'} pen, width ${w} mm, smoothing ${S.smoothing}`);
   for (const b of document.querySelectorAll('#erase-seg button')) b.setAttribute('aria-pressed', String(b.dataset.m === S.eraseMode));
   $('#erase-note').textContent = S.eraseMode === 'cut'
     ? `Cuts through lines where it passes, as wide as the pen (${w} mm).`
@@ -2568,6 +2590,7 @@ function bindUI() {
   $('#nib-list').onclick = (e) => { const b = e.target.closest('button'); if (b) { setNib(Number(b.dataset.w)); hideNibs(); } };
   $('#smooth-range').oninput = (e) => setSmoothing(Number(e.target.value));
   $('#brush-seg').onclick = (e) => { const b = e.target.closest('button'); if (b) setBrush(b.dataset.b); };
+  $('#ink-seg').onclick = (e) => { const b = e.target.closest('button'); if (b) setInk(b.dataset.ink); };
   $('#erase-seg').onclick = (e) => { const b = e.target.closest('button'); if (b) { setEraseMode(b.dataset.m); hideNibs(); } };
   $('#eraser-btn').onclick = toggleEraser;
   $('#undo-btn').onclick = undo;
@@ -2683,6 +2706,7 @@ function bindUI() {
     else if (k === '[') setSmoothing(S.smoothing - 10);
     else if (k === ']') setSmoothing(S.smoothing + 10);
     else if (k === 'e') toggleEraser();
+    else if (k === 'w') toggleInk();
     else if (k === 'f') { if (e.shiftKey) showParts(); else togglePart('key'); }
     else if (k === 'g') toggleFill();
     else if (k === '0') fit();
@@ -2738,6 +2762,7 @@ async function init() {
   S.eraseMode = localStorage.getItem('nh-erase-mode') === 'cut' ? 'cut' : 'stroke';
   S.smoothing = clamp(Number(localStorage.getItem('nh-smooth')) || 0, 0, 100);
   S.brush = BRUSHES[localStorage.getItem('nh-brush')] ? localStorage.getItem('nh-brush') : 'technical';
+  S.ink = localStorage.getItem('nh-ink') === 'white' ? 'white' : 'black';
   bindUI();
   updateTools();
   setDiag(S.diag);
@@ -2757,7 +2782,7 @@ async function init() {
 }
 
 // test hook (used by automated checks; harmless in normal use)
-window.__nh = { S, openDrawing, Loader, applyRemote, buildExport, undo, redo, togglePart, startPart, endPart, migrateFigures, partMembers, fit, Drive, syncAll, mergeData, Replay, Video };
+window.__nh = { S, setInk, toggleInk, svgOf, openDrawing, Loader, applyRemote, buildExport, undo, redo, togglePart, startPart, endPart, migrateFigures, partMembers, fit, Drive, syncAll, mergeData, Replay, Video };
 
 init();
 })();

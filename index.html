@@ -39,6 +39,7 @@
   .rail svg{width:24px;height:24px}
   .badge{position:absolute;right:3px;bottom:2px;font-size:10px;font-weight:700;line-height:1}
   #nib-btn span{position:absolute;bottom:2px;font-size:10px;font-variant-numeric:tabular-nums}
+  #nib-btn.white svg{background:#1e1e1c;color:#ffffff;border-radius:6px}
   #part-btn .lbl{position:absolute;bottom:1px;left:2px;right:2px;font-size:9px;line-height:1.1;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #part-btn svg{margin-bottom:6px}
   .badge.top{top:2px;bottom:auto}
@@ -188,6 +189,9 @@
   <button id="menu-btn" title="Menu"></button>
 </nav>
 <div class="pop" id="nib-pop" hidden aria-label="Pen settings">
+  <div class="seg" id="ink-seg" role="group" aria-label="Ink">
+    <button data-ink="black">Black</button><button data-ink="white">White</button>
+  </div>
   <div class="seg" id="brush-seg" role="group" aria-label="Pen type">
     <button data-b="technical">Technical</button><button data-b="ink">Ink pen</button><button data-b="brush">Brush pen</button>
   </div>

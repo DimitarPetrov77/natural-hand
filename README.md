@@ -56,6 +56,7 @@ Then open the menu, turn on **Show live pen data**, and draw a few lines. The pa
 | Pen type: technical, ink pen, brush pen | width button, top row | B |
 | Pen width (0.1 to 2.0 mm) | width button | 1 to 7 |
 | Smoothing (0 to 100) | slider under the widths | [ and ] |
+| White ink (and back to black) | width button, Black / White | W |
 | Eraser: whole lines or cut through | eraser button, or the Wacom eraser end | E |
 | Undo / redo | arrows | Ctrl+Z / Ctrl+Shift+Z |
 | Start / end a part (figure, head, structure...) | part button, or the pen's side button; press again when it is done | F |
@@ -98,6 +99,8 @@ Undo never deletes data: undone strokes stay in the file, marked with the time t
 
 **Pressure feel.** Menu, This device: set how hard you press for the ink pen and brush pen to reach full width, separately for each device, so the S Pen and the Wacom feel alike. It changes only the drawn width; recorded pressure stays raw, and each stroke stores the setting.
 
+**White ink.** In the width button, choose White to draw in white: white dots, white hairs, white lines carved into a black mass. White paints over what is already there, and anything drawn after it paints over the white, exactly in the order you drew. The pen button shows a white line on black while white is on; W switches back and forth. Width and pen type are shared with black. White marks are recorded as lines with `"ink": "white"`: they are drawing, not corrections, and the eraser and undo work on them like on any line.
+
 **Pen types.** Technical pen keeps one width. Ink pen and brush pen change width with pressure: ink pen gently, brush pen strongly, with thin starts and ends. The pressure itself is recorded the same way for all three.
 
 **Eraser.** It is always as wide as the pen and has one choice, in the width button while the eraser is on: **Whole lines** deletes every line it touches, exactly as the line was recorded; **Cut through** removes only the parts it passes over. Either way the ink is marked as erased in the data (`erased`) and left out of the final drawing, undoing the eraser brings it back, and the eraser strokes stay in the file as part of how you work.
@@ -117,7 +120,7 @@ One file per drawing: `<id>.json.gz` in Drive (plain `<id>.json` from Download J
   "sessions": [ { "id", "started", "device": { "name", "ppmm", ... }, "screen", "user_agent" } ],
   "sample_fields": ["dt_ms","x_mm","y_mm","pressure","tiltX","tiltY","twist","altitude","azimuth","tangential","width_px","height_px","buttons"],
   "strokes": [ {
-      "i", "session", "t0" (epoch ms), "tool", "width_mm", "parts": [part ids], "tags", "pointer_type",
+      "i", "session", "t0" (epoch ms), "tool", "ink" ("black" or "white"; absent means black), "width_mm", "parts": [part ids], "tags", "pointer_type",
       "view": [zoom, rotation_rad, tx, ty], "ppmm",
       "hover": [ [dt_ms (negative), x_mm, y_mm, ...], ... ],
       "samples": [ [dt_ms, x_mm, y_mm, pressure, ...], ... ],   (the drawn, smoothed path)
