@@ -63,7 +63,7 @@
   .pop .stroke{display:block;width:34px;border-radius:9px;background:currentColor}
   .pop small{font-variant-numeric:tabular-nums;font-size:12px}
 
-  .chips{position:fixed;z-index:2;top:max(8px,env(safe-area-inset-top));right:max(8px,env(safe-area-inset-right));display:flex;gap:6px}
+  .chips{position:fixed;z-index:2;top:max(8px,env(safe-area-inset-top));right:max(8px,env(safe-area-inset-right));display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px;max-width:calc(100vw - 16px)}
   .chip{background:var(--rail);color:var(--ink);border:0;border-radius:999px;padding:4px 10px;font:inherit;font-size:12px;
     box-shadow:0 0 0 1px var(--line);opacity:.88;cursor:pointer}
   .chip.warn{color:var(--warn)}
@@ -115,6 +115,7 @@
   .ruler .bar::before{left:0}.ruler .bar::after{right:0}
   .foot{font-size:.8rem;color:var(--muted)}
   .chip.prompt{background:var(--npb);color:var(--npb-ink);box-shadow:none;opacity:1;font-variant-numeric:tabular-nums}
+  .chip.update{background:var(--ink);color:var(--rail);box-shadow:none;opacity:1}
   .chip[hidden]{display:none}
   body.replaying .rail, body.replaying .chips, body.replaying #nib-pop{display:none}
   #replay-bar{position:fixed;z-index:5;left:0;right:0;bottom:0;background:var(--rail);box-shadow:0 0 0 1px var(--line);
@@ -176,6 +177,7 @@
   <button class="chip" id="zoom-chip" hidden></button>
   <button class="chip" id="save-chip" tabindex="-1">Saved</button>
   <button class="chip" id="drive-chip">Drive off</button>
+  <button class="chip update" id="update-chip" hidden>New version ready. Reload</button>
 </div>
 <div id="diag" hidden></div>
 <div id="toast" hidden role="status"></div>

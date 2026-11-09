@@ -8,7 +8,7 @@
 'use strict';
 (() => {
 
-const APP_VERSION = '0.6.1';
+const APP_VERSION = '0.6.2';
 const FORMAT = 'natural-hand/1';
 const SAMPLE_FIELDS = ['dt_ms','x_mm','y_mm','pressure','tiltX','tiltY','twist','altitude','azimuth','tangential','width_px','height_px','buttons'];
 const PAPERS = { A5: [148, 210], A4: [210, 297], A3: [297, 420], A2: [420, 594], A1: [594, 841], Square: [300, 300] };
@@ -2067,6 +2067,27 @@ async function startDrawing() {
   else await newDrawing(defaultPaper(), false, '');
 }
 
+// ---------- app updates ----------
+// The service worker installs a new version in the background and takes over this page.
+// The page keeps running the old code until it reloads, so offer a reload (never forced mid-drawing).
+function watchForUpdates() {
+  if (!('serviceWorker' in navigator) || !(location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) return;
+  const hadController = !!navigator.serviceWorker.controller; // false on the very first install: nothing old is running
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController) $('#update-chip').hidden = false; });
+  navigator.serviceWorker.register('sw.js').then((reg) => {
+    const check = () => reg.update().catch(() => {});
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') check(); });
+    setInterval(check, 30 * 60 * 1000);
+  }).catch(() => {});
+  $('#update-chip').onclick = async () => {
+    const c = $('#update-chip'); c.disabled = true; c.textContent = 'Saving…';
+    await waitIdle();
+    while (performance.now() - S.lastPen < 800) await new Promise((r) => setTimeout(r, 200)); // let the last stroke reach storage
+    await flushMeta();
+    location.reload();
+  };
+}
+
 async function init() {
   syncClock();
   readSurround();
@@ -2082,9 +2103,7 @@ async function init() {
   try { await DB.open(); }
   catch (err) { toast('This browser blocked local storage, so drawings cannot be saved: ' + err.message); return; }
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
-  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
-  }
+  watchForUpdates();
   Drive.restore();
   updateDriveChip();
   setInterval(autoSync, 20000);

@@ -34,6 +34,8 @@ Google's sign-in lasts about an hour. When it runs out, the Drive chip in the to
 
 Open the GitHub Pages address in Chrome, then menu, **Add to home screen** (or Install app). It opens full screen and works offline.
 
+Updates install themselves in the background. When one is ready, a dark **New version ready. Reload** chip appears in the top corner; tap it when you are between strokes. It saves first, then reloads. The app checks for updates each time you come back to it, and every 30 minutes while it is open.
+
 ## 4. Set up each device
 
 The first launch asks for a device name and a size calibration. Do both on every device: they are stored with every stroke, so the model can tell your hands on different surfaces apart, and strokes are stored in real millimetres.
@@ -124,6 +126,14 @@ Positions are paper millimetres from the top-left corner. Every coalesced sample
 ```
 python tools/load.py path/to/folder
 ```
+
+`tools/health.py` checks that each device records what it should. Run it on the first drawings from every device, before collecting a lot more:
+
+```
+python tools/health.py path/to/folder
+```
+
+It prints a summary per device and writes `health.html` next to the drawings. The report covers the real sample rate and gaps (dropped samples), whether pressure tops out, whether tilt and hover are reported, and calibration, each marked OK, Check or Info with what to do. It also has histograms of sample timing, pressure, speed and tilt.
 
 ## Known limits
 

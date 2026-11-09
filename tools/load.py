@@ -37,6 +37,7 @@ class Stroke:
     erased: list = field(default_factory=list)   # [[first, last, eraser_i], ...]
     prompt: str | None = None  # session prompt id (see drawing.meta["prompts"])
     pressure_gamma: float = 1.0
+    hover_dropped: int = 0     # hover samples dropped because the pen hovered very long before this stroke
 
     def col(self, name, which="samples"):
         return getattr(self, which)[:, self.fields.index(name)]
@@ -104,7 +105,8 @@ def load_drawing(path) -> Drawing:
             samples=_arr(s["samples"], len(fields)), hover=_arr(hov, len(fields)), fields=fields,
             raw=_arr(s["raw"], len(fields)) if s.get("raw") else _arr(s["samples"], len(fields)),
             brush=s.get("brush") or "technical", smoothing_tau_ms=s.get("smoothing_tau_ms") or 0.0,
-            erased=s.get("erased") or [], prompt=s.get("prompt"), pressure_gamma=s.get("pressure_gamma") or 1.0))
+            erased=s.get("erased") or [], prompt=s.get("prompt"), pressure_gamma=s.get("pressure_gamma") or 1.0,
+            hover_dropped=s.get("hover_dropped") or 0))
     meta = {k: v for k, v in d.items() if k not in ("strokes", "events")}
     return Drawing(d["id"], meta, fields, strokes, d.get("events", []))
 
