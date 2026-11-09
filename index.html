@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#2c2b29">
+<title>Natural Hand</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<style>
+  :root{
+    --surround:#575651; --rail:#f3f3f0; --ink:#1e1e1c; --muted:#6b6a65; --line:#d6d5cf;
+    --npb:#a4dded; --npb-ink:#0d3846; --warn:#8a3b12;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --surround:#252422; --rail:#353431; --ink:#ecebe6; --muted:#a8a7a1; --line:#4b4a46; --warn:#f0a57c; }
+  }
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--surround);color:var(--ink);
+    font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans",sans-serif;
+    overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;-webkit-touch-callout:none}
+  #view{position:fixed;inset:0;display:block;touch-action:none;cursor:crosshair}
+
+  .rail{position:fixed;z-index:3;display:flex;gap:4px;background:var(--rail);padding:6px;box-shadow:0 0 0 1px var(--line)}
+  @media (orientation:landscape){
+    .rail{left:0;top:0;bottom:0;flex-direction:column;padding-left:max(6px,env(safe-area-inset-left));overflow-y:auto}
+  }
+  @media (orientation:portrait){
+    .rail{left:0;right:0;bottom:0;flex-direction:row;justify-content:space-between;padding-bottom:max(6px,env(safe-area-inset-bottom));overflow-x:auto}
+  }
+  .rail .spacer{flex:1}
+  .rail button{flex:none;width:44px;height:44px;border:0;border-radius:10px;background:transparent;color:inherit;
+    display:grid;place-items:center;padding:0;cursor:pointer;position:relative}
+  .rail button:active{background:var(--line)}
+  .rail button[aria-pressed="true"]{background:var(--ink);color:var(--rail)}
+  .rail button.tag[aria-pressed="true"]{background:var(--npb);color:var(--npb-ink)}
+  .rail button:disabled{opacity:.35}
+  .rail svg{width:24px;height:24px}
+  .badge{position:absolute;right:3px;bottom:2px;font-size:10px;font-weight:700;line-height:1}
+  #nib-btn span{position:absolute;bottom:2px;font-size:10px;font-variant-numeric:tabular-nums}
+  button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--npb);outline-offset:2px}
+
+  .pop{position:fixed;z-index:4;background:var(--rail);border-radius:12px;padding:6px;display:flex;gap:2px;
+    box-shadow:0 0 0 1px var(--line),0 6px 20px rgba(0,0,0,.25)}
+  .pop[hidden]{display:none}
+  @media (orientation:landscape){.pop{flex-direction:column}}
+  .pop button{border:0;background:transparent;color:inherit;border-radius:8px;padding:6px 10px;display:flex;align-items:center;gap:10px;cursor:pointer;min-width:44px;min-height:40px}
+  @media (orientation:portrait){.pop button{flex-direction:column;gap:4px;padding:6px 4px}}
+  .pop button[aria-pressed="true"]{background:var(--ink);color:var(--rail)}
+  .pop .stroke{display:block;width:34px;border-radius:9px;background:currentColor}
+  .pop small{font-variant-numeric:tabular-nums;font-size:12px}
+
+  .chips{position:fixed;z-index:2;top:max(8px,env(safe-area-inset-top));right:max(8px,env(safe-area-inset-right));display:flex;gap:6px}
+  .chip{background:var(--rail);color:var(--ink);border:0;border-radius:999px;padding:4px 10px;font:inherit;font-size:12px;
+    box-shadow:0 0 0 1px var(--line);opacity:.88;cursor:pointer}
+  .chip.warn{color:var(--warn)}
+
+  #diag{position:fixed;z-index:2;top:max(8px,env(safe-area-inset-top));background:var(--rail);border-radius:10px;padding:8px 12px;
+    font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums;box-shadow:0 0 0 1px var(--line);max-width:300px;pointer-events:none;opacity:.94}
+  @media (orientation:landscape){#diag{left:72px}}
+  @media (orientation:portrait){#diag{left:8px;top:44px}}
+  #diag[hidden]{display:none}
+  #diag b{font-weight:600}
+  #diag .no{color:var(--muted)}
+  #diag .note{color:var(--warn);margin-top:4px}
+
+  #toast{position:fixed;z-index:6;left:50%;transform:translateX(-50%);bottom:80px;background:var(--ink);color:var(--rail);
+    padding:8px 14px;border-radius:10px;font-size:14px;max-width:min(420px,90vw);pointer-events:none}
+  #toast[hidden]{display:none}
+
+  dialog{border:0;border-radius:16px;padding:0;background:var(--rail);color:var(--ink);
+    width:min(440px,calc(100vw - 24px));max-height:calc(100dvh - 24px)}
+  dialog::backdrop{background:rgba(18,18,16,.55)}
+  .sheet{padding:18px 20px 20px;display:grid;gap:12px;overflow:auto;max-height:calc(100dvh - 24px);box-sizing:border-box}
+  .sheet h2{font-size:1.2rem;margin:0;font-weight:650;letter-spacing:-.01em}
+  .sheet h3{font-size:.9rem;margin:.5rem 0 0;color:var(--muted);font-weight:600}
+  .sheet p{margin:0;color:var(--muted);font-size:.92rem}
+  label{display:grid;gap:4px;font-size:.9rem}
+  label.check{display:flex;align-items:center;gap:10px}
+  input,select,textarea{font:inherit;color:inherit;background:transparent;border:1px solid var(--line);border-radius:8px;padding:8px 10px;
+    -webkit-user-select:text;user-select:text}
+  input[type=checkbox]{width:20px;height:20px;padding:0;accent-color:var(--ink)}
+  input[type=range]{padding:0;border:0}
+  textarea{min-height:60px;resize:vertical}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .btn{font:inherit;border:1px solid var(--line);background:transparent;color:inherit;border-radius:10px;padding:9px 14px;cursor:pointer;min-height:42px}
+  .btn.primary{background:var(--ink);color:var(--rail);border-color:var(--ink)}
+  .btn.danger{color:var(--warn)}
+  .sep{height:1px;background:var(--line);margin:4px 0}
+  .list{display:grid;gap:8px}
+  .item{display:grid;grid-template-columns:56px 1fr auto;gap:10px;align-items:center;border:1px solid var(--line);border-radius:10px;padding:8px}
+  .item img{width:56px;height:56px;object-fit:contain;background:#fff;border-radius:4px}
+  .item .meta{font-size:.82rem;color:var(--muted)}
+  .item .name{font-weight:600;word-break:break-all}
+  .item .acts{display:flex;flex-direction:column;gap:4px}
+  .item .acts .btn{padding:4px 10px;min-height:32px;font-size:.85rem}
+  .current{border-color:var(--ink)}
+  .ruler{height:56px;position:relative;margin:8px 0}
+  .ruler .bar{position:absolute;left:0;top:26px;height:4px;background:var(--ink)}
+  .ruler .bar::before,.ruler .bar::after{content:"";position:absolute;top:-22px;width:2px;height:48px;background:var(--ink)}
+  .ruler .bar::before{left:0}.ruler .bar::after{right:0}
+  .foot{font-size:.8rem;color:var(--muted)}
+  @media (prefers-reduced-motion:no-preference){ .rail button,.chip{transition:background-color .12s} }
+</style>
+</head>
+<body>
+<canvas id="view" aria-label="Drawing canvas"></canvas>
+
+<nav class="rail" id="rail" aria-label="Tools">
+  <button id="nib-btn" title="Pen width (1–7)" aria-haspopup="true"></button>
+  <button id="eraser-btn" title="Eraser (E)" aria-pressed="false"></button>
+  <button id="undo-btn" title="Undo (Ctrl+Z)"></button>
+  <button id="redo-btn" title="Redo (Ctrl+Shift+Z)"></button>
+  <button id="figure-btn" class="tag" title="Mark a figure (F)" aria-pressed="false"></button>
+  <button id="fill-btn" class="tag" title="Mark black fill (G)" aria-pressed="false"></button>
+  <div class="spacer"></div>
+  <button id="fit-btn" title="Fit page (0)"></button>
+  <button id="menu-btn" title="Menu"></button>
+</nav>
+<div class="pop" id="nib-pop" hidden role="menu" aria-label="Pen width"></div>
+
+<div class="chips">
+  <button class="chip" id="save-chip" tabindex="-1">Saved</button>
+  <button class="chip" id="drive-chip">Drive off</button>
+</div>
+<div id="diag" hidden></div>
+<div id="toast" hidden role="status"></div>
+
+<dialog id="menu">
+  <div class="sheet">
+    <h2 id="menu-title">Drawing</h2>
+    <label>Title <input id="m-title" placeholder="Untitled"></label>
+    <label>Tags <input id="m-tags" placeholder="figures, study, landscape"></label>
+    <label>Notes <textarea id="m-notes" placeholder="Mood, music, what you were after"></textarea></label>
+    <div class="row">
+      <button class="btn primary" id="m-new">New drawing</button>
+      <button class="btn" id="m-list">Your drawings</button>
+      <button class="btn" id="m-export">Download JSON</button>
+    </div>
+    <div class="sep"></div>
+    <h3>Google Drive</h3>
+    <p id="m-drive-text">Not connected.</p>
+    <div class="row">
+      <button class="btn" id="m-drive-connect">Connect Google Drive</button>
+      <button class="btn" id="m-drive-sync">Sync now</button>
+    </div>
+    <div class="sep"></div>
+    <h3>This device</h3>
+    <label>Name <input id="m-dev-name" list="dev-names"></label>
+    <p id="m-dev-scale"></p>
+    <label>Pen pressure setting <input id="m-dev-pressure" placeholder="e.g. Wacom feel: default"></label>
+    <label class="check"><input type="checkbox" id="m-touch"> Finger moves and zooms the page</label>
+    <label class="check"><input type="checkbox" id="m-diag"> Show live pen data</label>
+    <div class="row"><button class="btn" id="m-calib">Calibrate size</button></div>
+    <div class="sep"></div>
+    <p class="foot" id="m-foot"></p>
+    <div class="row"><button class="btn" id="m-close">Close</button></div>
+  </div>
+</dialog>
+
+<dialog id="list-dlg">
+  <div class="sheet">
+    <h2>Your drawings</h2>
+    <p>Stored on this device. Deleting here does not touch copies in Google Drive.</p>
+    <div class="list" id="list"></div>
+    <div class="row"><button class="btn" id="list-close">Close</button></div>
+  </div>
+</dialog>
+
+<dialog id="new-dlg">
+  <div class="sheet">
+    <h2>New drawing</h2>
+    <label>Paper
+      <select id="n-paper"><option>A5</option><option selected>A4</option><option>A3</option></select>
+    </label>
+    <label>Orientation
+      <select id="n-orient"><option value="p">Portrait</option><option value="l">Landscape</option></select>
+    </label>
+    <label>Title <input id="n-title" placeholder="Optional"></label>
+    <div class="row"><button class="btn primary" id="n-create">Create</button><button class="btn" id="n-cancel">Cancel</button></div>
+  </div>
+</dialog>
+
+<dialog id="setup-dlg">
+  <div class="sheet">
+    <h2>Set up this device</h2>
+    <p>Every device draws a little differently, so each one gets its own name and size calibration. Both are saved with every stroke.</p>
+    <label>Device name <input id="s-name" list="dev-names" placeholder="Galaxy Tab S7"></label>
+    <div class="row"><button class="btn primary" id="s-next">Continue to calibration</button></div>
+  </div>
+</dialog>
+
+<dialog id="calib-dlg">
+  <div class="sheet">
+    <h2>Calibrate size</h2>
+    <p>This lets your strokes be stored in real millimetres. Hold the reference against the screen and adjust until the bar matches it exactly.</p>
+    <label>Reference
+      <select id="c-ref">
+        <option value="53.98">Bank card, short edge (54 mm)</option>
+        <option value="50">Ruler, 50 mm</option>
+      </select>
+    </label>
+    <div class="ruler"><div class="bar" id="c-bar"></div></div>
+    <input type="range" id="c-range" min="100" max="800" step="0.25" aria-label="Bar length">
+    <div class="row">
+      <button class="btn" id="c-minus" aria-label="Shorter">−</button>
+      <button class="btn" id="c-plus" aria-label="Longer">+</button>
+      <span id="c-val" class="foot"></span>
+    </div>
+    <div class="row"><button class="btn primary" id="c-save">Save calibration</button><button class="btn" id="c-cancel">Cancel</button></div>
+  </div>
+</dialog>
+
+<datalist id="dev-names">
+  <option value="Wacom on PC"><option value="Galaxy Tab S7"><option value="Galaxy S26 Ultra">
+</datalist>
+
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
