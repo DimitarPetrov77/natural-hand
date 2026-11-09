@@ -8,7 +8,7 @@
 'use strict';
 (() => {
 
-const APP_VERSION = '0.6.2';
+const APP_VERSION = '0.6.3';
 const FORMAT = 'natural-hand/1';
 const SAMPLE_FIELDS = ['dt_ms','x_mm','y_mm','pressure','tiltX','tiltY','twist','altitude','azimuth','tangential','width_px','height_px','buttons'];
 const PAPERS = { A5: [148, 210], A4: [210, 297], A3: [297, 420], A2: [420, 594], A1: [594, 841], Square: [300, 300] };
@@ -79,7 +79,15 @@ const DB = {
   add(store, v) { return this.write(store, (tx) => tx.objectStore(store).add(v)); },
   get(store, k) { return this.read(store, (s) => s.get(k)); },
   all(store) { return this.read(store, (s) => s.getAll()); },
-  strokes(id) { return this.read('strokes', (s) => s.getAll(IDBKeyRange.bound([id, 0], [id, Infinity]))); },
+  async strokes(id) { // in batches: each batch is decoded separately, so the page keeps breathing
+    const out = [];
+    for (;;) {
+      const lo = out.length ? out[out.length - 1].i : 0;
+      const part = await this.read('strokes', (s) => s.getAll(IDBKeyRange.bound([id, lo], [id, Infinity], out.length > 0), 500));
+      for (const st of part) out.push(st);
+      if (part.length < 500) return out;
+    }
+  },
   events(id) { return this.read('events', (s) => s.index('drawing').getAll(id)); },
   replaceDrawing(meta, strokes, events) {
     const id = meta.id;
@@ -208,6 +216,9 @@ function visibleDocRect() {
   return { x0: Math.min(...c.map((p) => p[0])), x1: Math.max(...c.map((p) => p[0])), y0: Math.min(...c.map((p) => p[1])), y1: Math.max(...c.map((p) => p[1])) };
 }
 function clipPaper(ctx) { if (S.endless) return; const b = S.paper.b; ctx.beginPath(); ctx.rect(b.x0, b.y0, b.w, b.h); ctx.clip(); }
+// true when the screen shows more pixels per mm than the page bitmap holds (zoomed in):
+// only then are strokes redrawn from vectors; otherwise the bitmap is already sharp enough
+function vectorView() { return S.ppmm * S.view.s * dpr > S.paper.K * 1.05; }
 function renderSharp() {
   if (!S.paper || Replay.on) return;
   if (gesture || mousePan) { scheduleSharp(); return; }
@@ -217,6 +228,13 @@ function renderSharp() {
   sctx.fillRect(0, 0, sharp.width, sharp.height);
   applyView(sctx);
   const pb = S.paper.b;
+  if (!vectorView()) {
+    sctx.imageSmoothingEnabled = true; sctx.imageSmoothingQuality = 'high';
+    sctx.drawImage(S.paper.c, pb.x0, pb.y0, pb.w, pb.h);
+    sharpKey = viewKey();
+    requestRender();
+    return;
+  }
   sctx.fillStyle = '#ffffff';
   if (!S.endless) sctx.fillRect(pb.x0, pb.y0, pb.w, pb.h);
   sctx.save(); clipPaper(sctx);
@@ -414,10 +432,10 @@ function segSeg(p, q, A, B) {
   if (o(p, q, A) * o(p, q, B) < 0 && o(A, B, p) * o(A, B, q) < 0) return 0;
   return Math.min(ptSeg(p[1], p[2], A, B), ptSeg(q[1], q[2], A, B), ptSeg(A[1], A[2], [0, p[1], p[2]], [0, q[1], q[2]]), ptSeg(B[1], B[2], [0, p[1], p[2]], [0, q[1], q[2]]));
 }
-function computeErasure(strokes) {
-  const result = new Map();
-  for (const E of strokes) {
-    if (E.tool !== 'eraser' || E.undone_at || !E.samples.length) continue;
+// the parts of earlier, visible strokes that one eraser stroke removes: Map(stroke -> ranges)
+function eraserHits(E, strokes, result = new Map()) {
+  {
+    if (E.tool !== 'eraser' || E.undone_at || !E.samples.length) return result;
     const whole = eraseModeOf(E) === 'stroke';
     // reach: the eraser's half width plus up to 2 mm for the touched line's own width;
     // whole-line erasing gets at least 0.75 mm so thin lines are easy to hit
@@ -476,9 +494,16 @@ function computeErasure(strokes) {
       }
     }
   }
+  return result;
+}
+// full recomputation from every eraser (opening old drawings, merging another device's copy);
+// strokes that are undone keep their ranges, so a redo shows them as they were
+function computeErasure(strokes) {
+  const result = new Map();
+  for (const E of strokes) eraserHits(E, strokes, result);
   const changed = [];
   for (const T of strokes) {
-    if (T.tool === 'eraser') continue;
+    if (T.tool === 'eraser' || T.undone_at) continue;
     const nr = result.get(T) || null;
     const was = T.erased && T.erased.length ? JSON.stringify(T.erased) : null;
     const now = nr ? JSON.stringify(nr) : null;
@@ -486,10 +511,29 @@ function computeErasure(strokes) {
   }
   return changed;
 }
-function applyErasure() {
-  const changed = computeErasure(S.strokes);
+// incremental erasing: only the eraser that just finished, was undone or redone is evaluated
+function addErasure(E) {
+  const changed = [];
+  for (const [T, ranges] of eraserHits(E, S.strokes)) {
+    T.erased = (T.erased || []).filter((g) => g[2] !== E.i).concat(ranges);
+    changed.push(T);
+  }
+  return changed;
+}
+function removeErasure(E) {
+  const changed = [];
+  for (const T of S.strokes) {
+    if (!T.erased || !T.erased.some((g) => g[2] === E.i)) continue;
+    const keep = T.erased.filter((g) => g[2] !== E.i);
+    T.erased = keep.length ? keep : null;
+    changed.push(T);
+  }
+  return changed;
+}
+// after an eraser change: save the touched strokes and redraw only where they are
+function eraserChanged(E, changed) {
   for (const st of changed) saveStroke(st);
-  return changed.length;
+  repaintRegion([E, ...changed].map(bboxOf).reduce(unionBox));
 }
 function paintAll(ctx, strokes, b, K, bg = '#ffffff') {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -498,10 +542,67 @@ function paintAll(ctx, strokes, b, K, bg = '#ffffff') {
   ctx.setTransform(K, 0, 0, K, -b.x0 * K, -b.y0 * K);
   for (const st of strokes) if (visibleInk(st)) drawStroke(ctx, st);
 }
+/* Full repaint of the page bitmap. Big drawings take a while, so it runs in slices
+ * of about 12 ms and the app stays responsive (the drawing appears in order). Live
+ * ink and region repaints during a slow repaint are fine: finished ink is all black. */
+let paintGen = 0, painting = false;
+const yieldNow = () => new Promise((r) => setTimeout(r, 0));
 function repaint() {
-  const { x, K, b } = S.paper;
-  paintAll(x, S.strokes, b, K);
-  invalidateSharp();
+  const gen = ++paintGen, p = S.paper, { x, K, b } = p, list = S.strokes.slice();
+  x.setTransform(1, 0, 0, 1, 0, 0);
+  x.fillStyle = '#ffffff'; x.fillRect(0, 0, x.canvas.width, x.canvas.height);
+  x.setTransform(K, 0, 0, K, -b.x0 * K, -b.y0 * K);
+  painting = true;
+  let i = 0;
+  const slice = () => {
+    if (gen !== paintGen || S.paper !== p) return;
+    const end = performance.now() + 12;
+    x.setTransform(K, 0, 0, K, -b.x0 * K, -b.y0 * K);
+    while (i < list.length && performance.now() < end) { const st = list[i++]; if (visibleInk(st)) drawStroke(x, st); }
+    if (i < list.length) setTimeout(slice, 0); else painting = false;
+    invalidateSharp(); requestRender();
+  };
+  slice();
+}
+const unionBox = (a, b) => ({ x0: Math.min(a.x0, b.x0), y0: Math.min(a.y0, b.y0), x1: Math.max(a.x1, b.x1), y1: Math.max(a.y1, b.y1) });
+const boxesMeet = (a, b) => !(a.x1 < b.x0 || a.x0 > b.x1 || a.y1 < b.y0 || a.y0 > b.y1);
+function strokesIn(r) { return S.strokes.filter((st) => st.samples.length && visibleInk(st) && boxesMeet(bboxOf(st), r)); }
+// redraw one area (doc mm box) of the page bitmap and the sharp layer, e.g. after undo or erasing
+function repaintRegion(r) {
+  const { x, K, b, c } = S.paper;
+  const X0 = clamp(Math.floor((r.x0 - b.x0) * K) - 1, 0, c.width), X1 = clamp(Math.ceil((r.x1 - b.x0) * K) + 1, 0, c.width);
+  const Y0 = clamp(Math.floor((r.y0 - b.y0) * K) - 1, 0, c.height), Y1 = clamp(Math.ceil((r.y1 - b.y0) * K) + 1, 0, c.height);
+  if (X1 > X0 && Y1 > Y0) {
+    x.save();
+    x.setTransform(1, 0, 0, 1, 0, 0);
+    x.beginPath(); x.rect(X0, Y0, X1 - X0, Y1 - Y0); x.clip();
+    x.fillStyle = '#ffffff'; x.fillRect(X0, Y0, X1 - X0, Y1 - Y0);
+    x.setTransform(K, 0, 0, K, -b.x0 * K, -b.y0 * K);
+    for (const st of strokesIn({ x0: b.x0 + X0 / K, y0: b.y0 + Y0 / K, x1: b.x0 + X1 / K, y1: b.y0 + Y1 / K })) drawStroke(x, st);
+    x.restore();
+  }
+  if (sharpKey === viewKey()) {
+    if (!vectorView()) renderSharp();
+    else {
+      const v = S.view, k = S.ppmm * v.s, co = Math.cos(v.r), si = Math.sin(v.r);
+      const pts = [[r.x0, r.y0], [r.x1, r.y0], [r.x0, r.y1], [r.x1, r.y1]].map(([X, Y]) => [(co * X * k - si * Y * k + v.tx) * dpr, (si * X * k + co * Y * k + v.ty) * dpr]);
+      const SX0 = clamp(Math.floor(Math.min(...pts.map((q) => q[0]))) - 1, 0, sharp.width), SX1 = clamp(Math.ceil(Math.max(...pts.map((q) => q[0]))) + 1, 0, sharp.width);
+      const SY0 = clamp(Math.floor(Math.min(...pts.map((q) => q[1]))) - 1, 0, sharp.height), SY1 = clamp(Math.ceil(Math.max(...pts.map((q) => q[1]))) + 1, 0, sharp.height);
+      if (SX1 > SX0 && SY1 > SY0) {
+        const dc = [[SX0, SY0], [SX1, SY0], [SX0, SY1], [SX1, SY1]].map(([a, bb]) => screenToDoc(a / dpr, bb / dpr));
+        const rr = { x0: Math.min(...dc.map((q) => q[0])), x1: Math.max(...dc.map((q) => q[0])), y0: Math.min(...dc.map((q) => q[1])), y1: Math.max(...dc.map((q) => q[1])) };
+        sctx.save();
+        sctx.setTransform(1, 0, 0, 1, 0, 0);
+        sctx.beginPath(); sctx.rect(SX0, SY0, SX1 - SX0, SY1 - SY0); sctx.clip();
+        sctx.fillStyle = S.endless ? '#ffffff' : surround; sctx.fillRect(SX0, SY0, SX1 - SX0, SY1 - SY0);
+        applyView(sctx);
+        if (!S.endless) { const pb = S.paper.b; sctx.fillStyle = '#ffffff'; sctx.fillRect(pb.x0, pb.y0, pb.w, pb.h); }
+        clipPaper(sctx);
+        for (const st of strokesIn(rr)) drawStroke(sctx, st);
+        sctx.restore();
+      }
+    }
+  }
   requestRender();
 }
 
@@ -674,7 +775,7 @@ function finish(e, cancelled) {
     st.samples.push(r.slice());
   }
   S.active = null;
-  if (st.tool === 'eraser') { applyErasure(); repaint(); }
+  if (st.tool === 'eraser') eraserChanged(st, addErasure(st));
   else { inkLive(st, from); maybeExtend(); }
   S.lastPen = performance.now();
   saveStroke(st);
@@ -728,8 +829,9 @@ function undo() {
       st.undone_at = rnd(absNow(), 3);
       S.redo.push(i);
       saveStroke(st); logEvent('undo', { stroke: i });
-      if (st.tool === 'eraser') applyErasure();
-      repaint(); markChanged(); updateTools();
+      if (st.tool === 'eraser') eraserChanged(st, removeErasure(st));
+      else repaintRegion(bboxOf(st));
+      markChanged(); updateTools();
       return;
     }
   }
@@ -739,8 +841,9 @@ function redo() {
   const i = S.redo.pop(), st = S.strokes[i];
   st.undone_at = null;
   saveStroke(st); logEvent('redo', { stroke: i });
-  if (st.tool === 'eraser') applyErasure();
-  repaint(); markChanged(); updateTools();
+  if (st.tool === 'eraser') eraserChanged(st, addErasure(st));
+  else repaintRegion(bboxOf(st));
+  markChanged(); updateTools();
 }
 function setNib(w) { S.width = w; localStorage.setItem('nh-nib', String(w)); updateTools(); }
 function setEraseMode(m) { S.eraseMode = m === 'cut' ? 'cut' : 'stroke'; localStorage.setItem('nh-erase-mode', S.eraseMode); updateTools(); }
@@ -798,7 +901,7 @@ async function flushMeta() {
   clearTimeout(metaTimer);
   if (!S.meta) return;
   S.meta.updated = new Date().toISOString();
-  try { S.meta.thumb = makeThumb(); } catch {}
+  if (!painting) try { S.meta.thumb = makeThumb(); } catch {}
   try { await DB.put('drawings', S.meta); setSaveState('Saved'); }
   catch (err) { setSaveState('Save failed', true); toast('Could not save drawing: ' + err.message); }
   updateDriveChip();
@@ -820,7 +923,7 @@ async function newDrawing(paperName, landscape, title) {
     id: newId(), format: FORMAT, title: title || '', created: now, updated: now,
     paper,
     tags: [], notes: '', sessions: [], figure_count: 0, stroke_count: 0,
-    rev: 0, synced_rev: 0, drive: {}, view: null,
+    rev: 0, synced_rev: 0, drive: {}, view: null, erasure: 1,
   };
   await DB.put('drawings', meta);
   await openDrawing(meta.id);
@@ -837,7 +940,11 @@ async function openDrawing(id) {
     endless: !!meta.paper.endless, sessionId: `${Date.now().toString(36)}-${uid()}`, sessionLogged: false,
   });
   S.paper = makePaper(boundsOfMeta(meta, strokes));
-  applyErasure();
+  // erased parts are stored with each stroke; drawings from before the vector eraser get them computed once
+  if (meta.erasure !== 1) {
+    for (const st of computeErasure(strokes)) saveStroke(st);
+    meta.erasure = 1; scheduleMetaSave();
+  }
   repaint();
   localStorage.setItem('nh-last', id);
   if (meta.view) S.view = { ...meta.view }; else fit();
@@ -859,7 +966,7 @@ async function buildExport(id) {
   const meta = cur ? S.meta : await DB.get('drawings', id);
   let strokes = cur ? S.strokes.filter((s) => !S.active || s !== S.active.st) : (await DB.strokes(id)).sort((a, b) => a.i - b.i);
   const events = await DB.events(id);
-  const { thumb, drive, rev, synced_rev, synced_at, view: _v, ...m } = meta;
+  const { thumb, drive, rev, synced_rev, synced_at, view: _v, erasure: _e, ...m } = meta;
   return {
     ...m,
     format: FORMAT,
@@ -893,21 +1000,93 @@ function download(name, blob) {
   document.body.appendChild(a); a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
 }
+// the export as JSON text pieces, built a few strokes at a time so big drawings do not freeze the app
+async function exportParts(id) {
+  const { strokes, events, ...head } = await buildExport(id);
+  const parts = [JSON.stringify(head).slice(0, -1), ',"strokes":['];
+  let end = performance.now() + 10;
+  for (let i = 0; i < strokes.length; i++) {
+    parts.push((i ? ',' : '') + JSON.stringify(strokes[i]));
+    if (performance.now() > end) { await yieldNow(); end = performance.now() + 10; }
+  }
+  parts.push('],"events":', JSON.stringify(events), '}');
+  return parts;
+}
 async function exportJson(id) {
-  const data = await buildExport(id);
-  download(`${id}.json`, new Blob([JSON.stringify(data)], { type: 'application/json' }));
+  download(`${id}.json`, new Blob(await exportParts(id), { type: 'application/json' }));
 }
 async function previewPng(id) {
   const cur = S.meta && S.meta.id === id;
+  if (cur && !painting) { // the page bitmap already holds the drawing: scale it instead of redrawing every stroke
+    const p = S.paper, b = imageBounds(S.meta, S.strokes), K = Math.min(6, 2400 / Math.max(b.w, b.h));
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(b.w * K)); c.height = Math.max(1, Math.round(b.h * K));
+    const x = c.getContext('2d');
+    x.fillStyle = '#ffffff'; x.fillRect(0, 0, c.width, c.height);
+    x.imageSmoothingEnabled = true; x.imageSmoothingQuality = 'high';
+    x.drawImage(p.c, (b.x0 - p.b.x0) * p.K, (b.y0 - p.b.y0) * p.K, b.w * p.K, b.h * p.K, 0, 0, c.width, c.height);
+    return canvasBlob(c, 'image/png');
+  }
   const meta = cur ? S.meta : await DB.get('drawings', id);
   const strokes = cur ? S.strokes : (await DB.strokes(id)).sort((a, b) => a.i - b.i).map(normalizeStroke);
   const b = imageBounds(meta, strokes), K = Math.min(6, 2400 / Math.max(b.w, b.h));
   return canvasBlob(renderImage(strokes, b, K, '#ffffff'), 'image/png');
 }
-async function gzip(str) {
-  const stream = new Blob([str]).stream().pipeThrough(new CompressionStream('gzip'));
-  const buf = await new Response(stream).arrayBuffer();
+/* Compression and parsing of whole drawings run in a small background worker: in Chrome
+ * CompressionStream works on the calling thread, and big drawings would freeze the page.
+ * If a worker cannot start, the same work runs here instead. */
+const WORKER_SRC = `onmessage = async (e) => {
+  const { id, op, data } = e.data;
+  try {
+    if (op === 'gzip') {
+      const buf = await new Response(data.stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
+      postMessage({ id, result: buf }, [buf]);
+    } else {
+      const b = new Uint8Array(data), gz = b[0] === 0x1f && b[1] === 0x8b;
+      const text = gz ? await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('gzip'))).text() : new TextDecoder().decode(data);
+      postMessage({ id, result: JSON.parse(text) });
+    }
+  } catch (err) { postMessage({ id, error: String(err && err.message || err) }); }
+};`;
+let bgWorker, bgSeq = 0;
+function inWorker(op, data) {
+  if (bgWorker === undefined) {
+    try { bgWorker = new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' }))); }
+    catch { bgWorker = null; }
+  }
+  if (!bgWorker) return Promise.reject(new Error('no worker'));
+  return new Promise((res, rej) => {
+    const id = ++bgSeq, w = bgWorker;
+    const done = () => { w.removeEventListener('message', on); w.removeEventListener('error', bad); };
+    const on = (e) => {
+      if (e.data.id !== id) return;
+      done();
+      if (e.data.error) { const er = new Error(e.data.error); er.bad = true; rej(er); } else res(e.data.result);
+    };
+    const bad = (e) => { done(); bgWorker = null; rej(new Error(e.message || 'worker failed')); };
+    w.addEventListener('message', on); w.addEventListener('error', bad);
+    w.postMessage({ id, op, data });
+  });
+}
+async function gzip(parts) {
+  const list = Array.isArray(parts) ? parts : [parts], blobs = [];
+  let end = performance.now() + 10;
+  for (let i = 0; i < list.length; i += 200) { // text to bytes, a few hundred strokes at a time
+    blobs.push(new Blob(list.slice(i, i + 200)));
+    if (performance.now() > end) { await yieldNow(); end = performance.now() + 10; }
+  }
+  const blob = new Blob(blobs);
+  let buf;
+  try { buf = await inWorker('gzip', blob); }
+  catch { buf = await new Response(blob.stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer(); }
   return new Blob([buf], { type: 'application/gzip' });
+}
+async function parseDrawingFile(buf) {
+  try { return await inWorker('parse', buf); } // copied, not handed over, so the fallback below still has it
+  catch (err) { if (err.bad) throw err; } // the file itself could not be read; otherwise the worker is unavailable
+  const b = new Uint8Array(buf), isGz = b[0] === 0x1f && b[1] === 0x8b;
+  const text = isGz ? await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).text() : new TextDecoder().decode(buf);
+  return JSON.parse(text);
 }
 
 /* ------------------------------------------------------------ Google Drive */
@@ -1014,11 +1193,7 @@ const Drive = {
     const r = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, { headers: { Authorization: 'Bearer ' + this.token } });
     if (r.status === 401) { this.token = null; localStorage.removeItem('nh-drive-token'); const e = new Error('Drive sign-in expired. Tap the Drive button to reconnect.'); e.status = 401; throw e; }
     if (!r.ok) { const e = new Error(`Drive download failed (${r.status})`); e.status = r.status; throw e; }
-    const buf = await r.arrayBuffer();
-    const b = new Uint8Array(buf);
-    const isGz = b[0] === 0x1f && b[1] === 0x8b;
-    const text = isGz ? await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).text() : new TextDecoder().decode(buf);
-    return JSON.parse(text);
+    return parseDrawingFile(await r.arrayBuffer());
   },
 };
 
@@ -1090,6 +1265,7 @@ async function applyRemote(id, remote, md5, fileId) {
   const { meta, strokes, events, renames } = mergeData(lm, ls, le, remote);
   strokes.forEach(normalizeStroke);
   computeErasure(strokes);
+  meta.erasure = 1;
   meta.drive = { ...(lm.drive || {}), json: fileId, md5 };
   await DB.replaceDrawing(meta, strokes, events);
   if (S.meta && S.meta.id === id) {
@@ -1104,7 +1280,7 @@ async function importRemote(file) {
   const remote = await Drive.download(file.id);
   const { strokes = [], events = [], sample_fields, units, exported, exported_by, ...m } = remote;
   if (!m.id || !m.paper) throw new Error('That file is not a Natural Hand drawing.');
-  const meta = { ...m, format: FORMAT, rev: 0, synced_rev: 0, synced_at: file.modifiedTime, drive: { json: file.id, md5: file.md5Checksum }, view: null, stroke_count: strokes.length };
+  const meta = { ...m, format: FORMAT, rev: 0, synced_rev: 0, synced_at: file.modifiedTime, drive: { json: file.id, md5: file.md5Checksum }, view: null, stroke_count: strokes.length, erasure: 1 };
   strokes.sort((a, b) => a.i - b.i).forEach((st) => { st.drawing = meta.id; normalizeStroke(st); });
   computeErasure(strokes);
   events.forEach((e) => { e.drawing = meta.id; });
@@ -1131,7 +1307,7 @@ async function syncOne(id) {
   if ((meta.rev || 0) <= (meta.synced_rev || 0) && meta.drive && meta.drive.json) return;
   if (S.meta && S.meta.id === id) await waitIdle();
   const rev = meta.rev || 0;
-  const gz = await gzip(JSON.stringify(await buildExport(id)));
+  const gz = await gzip(await exportParts(id));
   meta.drive = meta.drive || {};
   const props = { title: (meta.title || '').slice(0, 60), strokes: String(meta.stroke_count || 0), paper: meta.paper.name };
   const up = await Drive.put(`${id}.json.gz`, gz, meta.drive.json, folder, props);
