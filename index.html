@@ -39,6 +39,18 @@
   .rail svg{width:24px;height:24px}
   .badge{position:absolute;right:3px;bottom:2px;font-size:10px;font-weight:700;line-height:1}
   #nib-btn span{position:absolute;bottom:2px;font-size:10px;font-variant-numeric:tabular-nums}
+  #part-btn .lbl{position:absolute;bottom:1px;left:2px;right:2px;font-size:9px;line-height:1.1;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #part-btn svg{margin-bottom:6px}
+  .badge.top{top:2px;bottom:auto}
+  .pop .kinds{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px;min-width:240px}
+  .pop .kinds button{justify-content:flex-start;text-align:left;font:inherit;font-size:14px;flex-direction:row !important}
+  .pop .kinds button[aria-pressed="true"]{box-shadow:inset 0 0 0 1.5px var(--ink)}
+  .pop button.end{font:inherit;font-size:14px;background:var(--npb);color:var(--npb-ink);justify-content:center}
+  .pop button.link{font:inherit;font-size:13px;color:var(--muted);justify-content:center}
+  .krow{display:flex;justify-content:space-between;align-items:center;gap:8px;border-bottom:1px solid var(--line);padding:2px 0 6px}
+  .krow .btn{min-height:34px;padding:4px 10px;font-size:.85rem}
+  .item.part{grid-template-columns:1fr auto}
+  .item.part select{padding:4px 8px;font-weight:600}
   button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--npb);outline-offset:2px}
 
   .pop{position:fixed;z-index:4;background:var(--rail);border-radius:12px;padding:6px;display:flex;gap:2px;
@@ -117,7 +129,7 @@
   .chip.prompt{background:var(--npb);color:var(--npb-ink);box-shadow:none;opacity:1;font-variant-numeric:tabular-nums}
   .chip.update{background:var(--ink);color:var(--rail);box-shadow:none;opacity:1}
   .chip[hidden]{display:none}
-  body.replaying .rail, body.replaying .chips, body.replaying #nib-pop{display:none}
+  body.replaying .rail, body.replaying .chips, body.replaying #nib-pop, body.replaying #part-pop{display:none}
   #replay-bar{position:fixed;z-index:5;left:0;right:0;bottom:0;background:var(--rail);box-shadow:0 0 0 1px var(--line);
     display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding:10px 14px max(10px,env(safe-area-inset-bottom))}
   #replay-bar[hidden]{display:none}
@@ -126,6 +138,11 @@
   #rp-time{font-variant-numeric:tabular-nums;font-size:.9rem;min-width:7.5em}
   #rp-info{font-size:.82rem;color:var(--muted);flex:1 1 100%;order:9}
   #rp-play{min-width:6.5em}
+  #rp-label[aria-pressed="true"]{background:var(--npb);color:var(--npb-ink);border-color:var(--npb)}
+  #rp-lab{flex:1 1 100%;order:10;display:grid;gap:8px;border-top:1px solid var(--line);padding-top:10px}
+  #rp-lab[hidden]{display:none}
+  #lab-help{margin:0;font-size:.88rem;color:var(--muted)}
+  #lab-kind{padding:8px 10px;min-height:42px}
   #video-dlg progress{width:100%;height:8px;accent-color:var(--ink)}
   #video-dlg progress[hidden],#video-dlg [hidden]{display:none}
   .feel{display:grid;gap:4px}
@@ -147,7 +164,7 @@
   <button id="eraser-btn" title="Eraser (E)" aria-pressed="false"></button>
   <button id="undo-btn" title="Undo (Ctrl+Z)"></button>
   <button id="redo-btn" title="Redo (Ctrl+Shift+Z)"></button>
-  <button id="figure-btn" class="tag" title="Mark a figure (F)" aria-pressed="false"></button>
+  <button id="part-btn" class="tag" title="Start or end a part (F). Hold to choose its kind (Shift+F)" aria-pressed="false" aria-haspopup="true"></button>
   <button id="fill-btn" class="tag" title="Mark black fill (G)" aria-pressed="false"></button>
   <div class="spacer"></div>
   <button id="fit-btn" title="Fit page (0)"></button>
@@ -172,6 +189,13 @@
   </label>
 </div>
 
+<div class="pop" id="part-pop" hidden aria-label="Parts">
+  <div class="pop-title" id="part-title">Start a part</div>
+  <div class="kinds" id="kind-list" role="menu"></div>
+  <button id="part-end" class="end" hidden></button>
+  <button id="kinds-edit" class="link">Edit kinds…</button>
+</div>
+
 <div class="chips">
   <button class="chip prompt" id="prompt-chip" hidden></button>
   <button class="chip" id="zoom-chip" hidden></button>
@@ -192,6 +216,7 @@
       <button class="btn primary" id="m-new">New drawing</button>
       <button class="btn" id="m-list">Your drawings</button>
       <button class="btn" id="m-prompt">Start a session</button>
+      <button class="btn" id="m-parts">Parts</button>
     </div>
     <div class="sep"></div>
     <h3>Watch and export</h3>
@@ -220,7 +245,7 @@
       <div class="feel-ends"><span>Light touch</span><span>Firm touch</span></div>
       <p>How hard you press for ink pen and brush pen to reach full width. Recorded pressure is not changed.</p>
     </div>
-    <label class="check"><input type="checkbox" id="m-penbtn"> Pen side button marks figures</label>
+    <label class="check"><input type="checkbox" id="m-penbtn"> Pen side button starts and ends parts</label>
     <label class="check"><input type="checkbox" id="m-touch"> Finger moves and zooms the page</label>
     <label class="check"><input type="checkbox" id="m-diag"> Show live pen data</label>
     <div class="row"><button class="btn" id="m-calib">Calibrate size</button></div>
@@ -379,9 +404,38 @@
   </select>
   <label class="check"><input type="checkbox" id="rp-skip" checked> Skip pauses</label>
   <span id="rp-info"></span>
+  <button class="btn" id="rp-label" aria-pressed="false">Label parts</button>
   <button class="btn" id="rp-video">Export video</button>
   <button class="btn" id="rp-close">Close</button>
+  <div id="rp-lab" hidden>
+    <p id="lab-help"></p>
+    <div class="row">
+      <button class="btn" id="lab-from">From here</button>
+      <select id="lab-kind" aria-label="Kind of part"></select>
+      <button class="btn primary" id="lab-go">Label</button>
+      <button class="btn" id="lab-list">Parts</button>
+    </div>
+  </div>
 </div>
+
+<dialog id="kinds-dlg">
+  <div class="sheet">
+    <h2>Kinds of parts</h2>
+    <p>Your words for the things you draw. The list is kept on this device; parts you already marked keep their kind.</p>
+    <div class="list" id="kinds-list"></div>
+    <div class="row"><input id="kind-new" placeholder="New kind, e.g. Drip" maxlength="30" style="flex:1 1 160px"><button class="btn" id="kind-add">Add</button></div>
+    <div class="row"><button class="btn primary" id="kinds-close">Done</button></div>
+  </div>
+</dialog>
+
+<dialog id="parts-dlg">
+  <div class="sheet">
+    <h2>Parts in this drawing</h2>
+    <p id="parts-empty">No parts yet. Mark them while drawing with the part button, or label them here in replay.</p>
+    <div class="list" id="parts-list"></div>
+    <div class="row"><button class="btn" id="parts-kinds">Edit kinds</button><button class="btn primary" id="parts-close">Close</button></div>
+  </div>
+</dialog>
 
 <datalist id="dev-names">
   <option value="Wacom on PC"><option value="Galaxy Tab S7"><option value="Galaxy S26 Ultra">

@@ -6,6 +6,8 @@ Usage:
     for st in d.strokes:            # list of Stroke
         st.samples                  # numpy array, columns = d.fields
         st.xy, st.t, st.pressure    # convenience views
+    d.kinds(st)                 # kinds of the parts a stroke belongs to, outermost first, e.g. ["Figure", "Head"]
+    d.part_strokes("Figure")    # {part_id: [strokes]} for every part of that kind
 
     python load.py path/to/folder   # prints a summary of every drawing
 """
@@ -22,7 +24,7 @@ class Stroke:
     t0: float                 # epoch ms
     tool: str                 # "pen" or "eraser"
     width_mm: float
-    figure: int | None
+    figure: int | None       # older drawings only; the same strokes are in part "fig-N"
     tags: list
     pointer_type: str
     session: str
@@ -38,6 +40,7 @@ class Stroke:
     prompt: str | None = None  # session prompt id (see drawing.meta["prompts"])
     pressure_gamma: float = 1.0
     hover_dropped: int = 0     # hover samples dropped because the pen hovered very long before this stroke
+    parts: list = field(default_factory=list)  # ids of every part (figure, head, structure...) it belongs to
 
     def col(self, name, which="samples"):
         return getattr(self, which)[:, self.fields.index(name)]
@@ -81,6 +84,31 @@ class Drawing:
         """Ink strokes on the page (not undone, not eraser strokes)."""
         return [s for s in self.strokes if not s.undone and s.tool != "eraser"]
 
+    @property
+    def parts(self):
+        """Parts that count: {id: {"kind", "parent", "source", ...}} without removed ones."""
+        return {k: v for k, v in (self.meta.get("parts") or {}).items() if not v.get("removed_at")}
+
+    def depth(self, part_id):
+        n, p = 0, self.parts.get(part_id)
+        while p and p.get("parent") in self.parts:
+            n, p = n + 1, self.parts[p["parent"]]
+        return n
+
+    def kinds(self, st):
+        """Kinds of the parts a stroke belongs to, outermost first."""
+        ids = sorted((i for i in st.parts if i in self.parts), key=self.depth)
+        return [self.parts[i]["kind"] for i in ids]
+
+    def part_strokes(self, kind=None):
+        """{part_id: [strokes]} for every part (of one kind, if given)."""
+        out = {k: [] for k, v in self.parts.items() if kind is None or v["kind"] == kind}
+        for s in self.strokes:
+            for i in s.parts:
+                if i in out:
+                    out[i].append(s)
+        return out
+
 
 def _arr(rows, width):
     if not rows:
@@ -106,7 +134,7 @@ def load_drawing(path) -> Drawing:
             raw=_arr(s["raw"], len(fields)) if s.get("raw") else _arr(s["samples"], len(fields)),
             brush=s.get("brush") or "technical", smoothing_tau_ms=s.get("smoothing_tau_ms") or 0.0,
             erased=s.get("erased") or [], prompt=s.get("prompt"), pressure_gamma=s.get("pressure_gamma") or 1.0,
-            hover_dropped=s.get("hover_dropped") or 0))
+            hover_dropped=s.get("hover_dropped") or 0, parts=list(s.get("parts") or [])))
     meta = {k: v for k, v in d.items() if k not in ("strokes", "events")}
     return Drawing(d["id"], meta, fields, strokes, d.get("events", []))
 
@@ -119,13 +147,16 @@ def iter_drawings(folder):
 def summary(d: Drawing) -> str:
     vis = d.visible()
     n = sum(len(s.samples) for s in vis)
-    figs = len({s.figure for s in vis if s.figure is not None})
+    kinds = {}
+    for v in d.parts.values():
+        kinds[v["kind"]] = kinds.get(v["kind"], 0) + 1
+    parts = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items())) or "no parts"
     dev = {s["device"]["name"] for s in d.meta.get("sessions", [])}
     if vis:
         dur = (vis[-1].t0 + vis[-1].samples[-1, 0] - vis[0].t0) / 60000
     else:
         dur = 0
-    return f"{d.id}: {len(vis)} strokes, {n} samples, {figs} figures, {dur:.1f} min span, devices {sorted(dev)}"
+    return f"{d.id}: {len(vis)} strokes, {n} samples, {parts}, {dur:.1f} min span, devices {sorted(dev)}"
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@
 'use strict';
 (() => {
 
-const APP_VERSION = '0.6.3';
+const APP_VERSION = '0.7.0';
 const FORMAT = 'natural-hand/1';
 const SAMPLE_FIELDS = ['dt_ms','x_mm','y_mm','pressure','tiltX','tiltY','twist','altitude','azimuth','tangential','width_px','height_px','buttons'];
 const PAPERS = { A5: [148, 210], A4: [210, 297], A3: [297, 420], A2: [420, 594], A1: [594, 841], Square: [300, 300] };
@@ -134,7 +134,8 @@ const S = {
   eraseMode: 'stroke',     // 'stroke' deletes whole lines, 'cut' cuts through them
   brush: 'technical',
   smoothing: 0,
-  figure: null,
+  partStack: [],       // ids of the parts open while drawing, outermost first
+  kind: localStorage.getItem('nh-kind') || 'Figure', // kind the part button starts
   fill: false,
   active: null,        // {st, id}
   hover: [],
@@ -405,9 +406,9 @@ function strokeRuns(st, from = 0, to = st.samples.length, useMask = true) {
   }
   return { dot, runs };
 }
-function drawStroke(ctx, st, from = 0, to = undefined, useMask = true) {
+function drawStroke(ctx, st, from = 0, to = undefined, useMask = true, color = null) {
   const { dot, runs } = strokeRuns(st, from, to ?? st.samples.length, useMask);
-  ctx.strokeStyle = ctx.fillStyle = inkOf(st);
+  ctx.strokeStyle = ctx.fillStyle = color || inkOf(st);
   ctx.lineCap = 'round'; ctx.lineJoin = 'round';
   if (dot) { ctx.beginPath(); ctx.arc(dot[0], dot[1], dot[2], 0, Math.PI * 2); ctx.fill(); }
   for (const r of runs) {
@@ -655,6 +656,7 @@ function onDown(e) {
   hideNibs();
   if (e.pointerType === 'pen' && e.button === 2) { e.preventDefault(); penButton(); return; }
   if (Replay.on && e.pointerType !== 'touch') {
+    if (Replay.lab && e.button === 0 && !spaceDown) { Replay.loopStart(e); view.setPointerCapture(e.pointerId); return; }
     mousePan = { x: e.clientX, y: e.clientY, v: { ...S.view } };
     view.setPointerCapture(e.pointerId);
     return;
@@ -694,7 +696,7 @@ function onDown(e) {
     smoothing_tau_ms: eraserEnd || S.tool === 'eraser' ? 0 : tauFor(S.smoothing),
     pressure_gamma: rnd(S.device.pressure_gamma || 1, 4),
     prompt: S.prompt ? S.prompt.id : null,
-    figure: S.figure,
+    parts: S.partStack.slice(),
     tags: S.fill ? ['fill'] : [],
     pointer_type: e.pointerType,
     view: [rnd(S.view.s, 6), rnd(S.view.r, 6), rnd(S.view.tx, 2), rnd(S.view.ty, 2)],
@@ -724,6 +726,7 @@ function onMove(e) {
     if (touches.has(e.pointerId)) { touches.set(e.pointerId, { x: e.clientX, y: e.clientY }); moveGesture(); }
     return;
   }
+  if (Replay.drawingLoop && e.pointerId === Replay.loopId) { Replay.loopMove(e); return; }
   if (mousePan) {
     S.view.tx = mousePan.v.tx + e.clientX - mousePan.x;
     S.view.ty = mousePan.v.ty + e.clientY - mousePan.y;
@@ -757,11 +760,13 @@ function onMove(e) {
 
 function onUp(e) {
   if (e.pointerType === 'touch') { endTouch(e); return; }
+  if (Replay.drawingLoop && e.pointerId === Replay.loopId) { Replay.loopEnd(); return; }
   if (mousePan) { mousePan = null; persistViewSoon(); return; }
   if (S.active && e.pointerId === S.active.id) finish(e, false);
 }
 function onCancel(e) {
   if (e.pointerType === 'touch') { endTouch(e); return; }
+  if (Replay.drawingLoop && e.pointerId === Replay.loopId) { Replay.drawingLoop = null; requestRender(); return; }
   if (mousePan) { mousePan = null; return; }
   if (S.active && e.pointerId === S.active.id) finish(e, true);
 }
@@ -850,29 +855,79 @@ function setEraseMode(m) { S.eraseMode = m === 'cut' ? 'cut' : 'stroke'; localSt
 function setBrush(b) { if (BRUSHES[b]) { S.brush = b; localStorage.setItem('nh-brush', b); if (S.tool === 'eraser') { S.tool = 'pen'; buildNibs(); } updateTools(); } }
 function setSmoothing(v) { S.smoothing = clamp(Math.round(v), 0, 100); localStorage.setItem('nh-smooth', String(S.smoothing)); updateTools(); }
 function toggleEraser() { S.tool = S.tool === 'eraser' ? 'pen' : 'eraser'; buildNibs(); updateTools(); }
-function toggleFigure(source = 'button') {
-  if (!S.meta) return;
-  if (S.figure == null) {
-    S.meta.figure_count = (S.meta.figure_count || 0) + 1;
-    S.figure = S.meta.figure_count;
-    logEvent('figure_start', { figure: S.figure, source });
-    toast(`Figure ${S.figure} started`);
-  } else {
-    logEvent('figure_end', { figure: S.figure, source });
-    toast(`Figure ${S.figure} done`);
-    S.figure = null;
-  }
+/* ------------------------------------------------------------ parts
+ * A part is a group of strokes that make one thing: a figure, a head, a structure, a shell.
+ * Its kind is a word from your own list, and parts can sit inside parts. Each stroke lists
+ * the ids of every part it belongs to (st.parts); meta.parts holds each part's kind, parent
+ * and origin. Parts are started and ended while drawing, or labelled afterwards in replay.
+ * Nothing is deleted: a removed part is marked with removed_at. */
+const DEFAULT_KINDS = ['Figure', 'Head', 'Crowd', 'Mass', 'Shell', 'Ribbed form'];
+const escHtml = (t) => String(t).replace(/[<&>"]/g, (c) => ({ '<': '&lt;', '&': '&amp;', '>': '&gt;', '"': '&quot;' }[c]));
+function loadKinds() {
+  try { const k = JSON.parse(localStorage.getItem('nh-kinds')); if (Array.isArray(k) && k.length) return k; } catch {}
+  return DEFAULT_KINDS.slice();
+}
+function saveKinds(k) { localStorage.setItem('nh-kinds', JSON.stringify(k)); }
+// your list on this device, plus kinds already used in this drawing
+function kindsList() {
+  const out = loadKinds();
+  for (const p of Object.values((S.meta && S.meta.parts) || {})) if (!p.removed_at && !out.includes(p.kind)) out.push(p.kind);
+  return out;
+}
+const newPartId = () => 'p' + Date.now().toString(36).slice(-5) + uid();
+function livePart(id) { const p = S.meta && S.meta.parts && S.meta.parts[id]; return p && !p.removed_at ? p : null; }
+function partsOf(st) { return (st.parts || []).filter((id) => livePart(id)); }
+function partMembers() {
+  const m = new Map();
+  for (const st of S.strokes) for (const id of partsOf(st)) { if (!m.has(id)) m.set(id, new Set()); m.get(id).add(st); }
+  return m;
+}
+function openPart() { return S.partStack.length ? S.meta.parts[S.partStack[S.partStack.length - 1]] : null; }
+function startPart(kind, source = 'button') {
+  if (!S.meta || !kind) return;
+  S.meta.parts = S.meta.parts || {};
+  const parent = S.partStack.length ? S.partStack[S.partStack.length - 1] : null;
+  const id = newPartId();
+  S.meta.parts[id] = { kind, parent, source: 'live', session: S.sessionId, created: rnd(absNow(), 3) };
+  S.partStack.push(id);
+  S.kind = kind; localStorage.setItem('nh-kind', kind);
+  logEvent('part_start', { part: id, kind, parent, source });
+  toast(parent ? `${kind} started, inside ${S.meta.parts[parent].kind}` : `${kind} started`);
   markChanged(); updateTools();
 }
-// the pen's side button (S Pen) or lower barrel button (Wacom) starts and ends a figure
+function endPart(source = 'button') {
+  const id = S.partStack.pop();
+  if (!id) return;
+  const p = S.meta.parts[id];
+  logEvent('part_end', { part: id, kind: p.kind, source });
+  // a part ended without any strokes in it is dropped (its start and end stay in the event log)
+  const empty = !S.strokes.some((st) => (st.parts || []).includes(id));
+  if (empty) delete S.meta.parts[id];
+  toast(empty ? `${p.kind} ended with nothing drawn, so it was not kept` : `${p.kind} done`);
+  markChanged(); updateTools();
+}
+function togglePart(source = 'button') { if (!S.meta) return; if (S.partStack.length) endPart(source); else startPart(S.kind, source); }
+// figures from before parts existed (st.figure = number) become parts 'fig-N' of kind Figure; safe to run again
+function migrateFigures(meta, strokes) {
+  const changed = [];
+  meta.parts = meta.parts || {};
+  for (const st of strokes) {
+    if (typeof st.figure !== 'number') continue;
+    const id = `fig-${st.figure}`;
+    if (!meta.parts[id]) meta.parts[id] = { kind: 'Figure', parent: null, source: 'figure', session: st.session, created: st.t0 };
+    if (!(st.parts || []).includes(id)) { st.parts = [...(st.parts || []), id]; changed.push(st); }
+  }
+  return changed;
+}
+// the pen's side button (S Pen) or lower barrel button (Wacom) starts and ends a part
 let lastPenButton = 0;
 function penButton() {
   if (!S.penButtonFigure || Replay.on) return;
   const t = performance.now();
   if (t - lastPenButton < 400) return;
   lastPenButton = t;
-  toggleFigure('pen_button');
-  if (navigator.vibrate) navigator.vibrate(S.figure != null ? 25 : [15, 60, 15]);
+  togglePart('pen_button');
+  if (navigator.vibrate) navigator.vibrate(S.partStack.length ? 25 : [15, 60, 15]);
 }
 function toggleFill() {
   S.fill = !S.fill;
@@ -923,7 +978,7 @@ async function newDrawing(paperName, landscape, title) {
     id: newId(), format: FORMAT, title: title || '', created: now, updated: now,
     paper,
     tags: [], notes: '', sessions: [], figure_count: 0, stroke_count: 0,
-    rev: 0, synced_rev: 0, drive: {}, view: null, erasure: 1,
+    rev: 0, synced_rev: 0, drive: {}, view: null, erasure: 1, parts: {},
   };
   await DB.put('drawings', meta);
   await openDrawing(meta.id);
@@ -936,9 +991,12 @@ async function openDrawing(id) {
   if (!meta) { toast('That drawing is no longer on this device.'); return; }
   const strokes = (await DB.strokes(id)).sort((a, b) => a.i - b.i).map(normalizeStroke);
   Object.assign(S, {
-    meta, strokes, redo: [], figure: null, fill: false, hover: [], hoverDropped: 0, active: null,
+    meta, strokes, redo: [], partStack: [], fill: false, hover: [], hoverDropped: 0, active: null,
     endless: !!meta.paper.endless, sessionId: `${Date.now().toString(36)}-${uid()}`, sessionLogged: false,
   });
+  const migrated = migrateFigures(meta, strokes);
+  for (const st of migrated) saveStroke(st);
+  if (migrated.length) scheduleMetaSave();
   S.paper = makePaper(boundsOfMeta(meta, strokes));
   // erased parts are stored with each stroke; drawings from before the vector eraser get them computed once
   if (meta.erasure !== 1) {
@@ -986,6 +1044,8 @@ async function buildExport(id) {
       samples: 'the drawn path: positions smoothed with an exponential filter (time constant smoothing_tau_ms); all other columns as reported by the device',
       raw: 'present when smoothing_tau_ms > 0: the unsmoothed device samples, same columns; absent means samples are raw',
       brush: 'technical (constant width), ink (width from pressure, mild), brush (width from pressure, strong); width_mm is the nominal width',
+      parts: 'on strokes: ids of every part (figure, head, structure...) the stroke belongs to. In the drawing, parts = {id: {kind, parent, source, session, created, removed_at?}}: kind is the artist\'s word for the thing, parent the part it sits inside, source "live" (marked while drawing), "replay" (labelled afterwards) or "figure" (a figure from before parts existed). Parts with removed_at were taken back and should be ignored',
+      figure: 'older strokes only: the figure number from before parts existed; the same strokes are in part "fig-N"',
       erased: '[[first_sample, last_sample, eraser_stroke_i], ...] parts of this stroke removed by later eraser strokes; the final drawing omits them',
       erase_mode: 'on eraser strokes: "stroke" deletes every line it touches (the whole range is marked), "cut" removes only the parts it passes over; the eraser is as wide as the pen',
       ppmm: 'CSS pixels per physical millimetre on this device at zoom 1 (from calibration)',
@@ -1203,15 +1263,18 @@ const Drive = {
  * For a stroke present in both, the copy from the more recently updated side wins
  * (that is where an undo or redo would have happened). */
 const strokeKey = (s) => `${s.session}|${s.t0}`;
-const eventKey = (e) => `${e.session}|${e.t}|${e.type}|${e.stroke ?? ''}|${e.figure ?? ''}`;
+const eventKey = (e) => `${e.session}|${e.t}|${e.type}|${e.stroke ?? ''}|${e.figure ?? ''}|${e.part ?? ''}`;
+const unionIds = (a, b) => { const out = [...(a || [])]; for (const x of b || []) if (!out.includes(x)) out.push(x); return out; };
 function mergeData(lm, ls, le, remote) {
   const id = lm.id;
   const remoteNewer = (remote.updated || '') > (lm.updated || '');
   const map = new Map();
   for (const st of ls) map.set(strokeKey(st), st);
   for (const st of remote.strokes || []) {
-    const k = strokeKey(st);
-    if (!map.has(k) || remoteNewer) map.set(k, { ...st });
+    const k = strokeKey(st), mine = map.get(k);
+    // part labels from both sides are kept (one device may have labelled strokes in replay)
+    if (!mine || remoteNewer) map.set(k, mine ? { ...st, parts: unionIds(mine.parts, st.parts) } : { ...st });
+    else if (st.parts && st.parts.length) mine.parts = unionIds(mine.parts, st.parts);
   }
   const strokes = [...map.values()].sort((a, b) => a.t0 - b.t0);
   const emap = new Map();
@@ -1240,17 +1303,27 @@ function mergeData(lm, ls, le, remote) {
   for (const e of events) if (typeof e.figure === 'number') maxFig = Math.max(maxFig, e.figure);
   const renames = new Map();
   for (const [fig, sessions] of starts) for (const sess of [...new Set(sessions)].slice(1)) renames.set(`${sess}|${fig}`, ++maxFig);
-  for (const st of strokes) { const r = renames.get(`${st.session}|${st.figure}`); if (r) st.figure = r; }
+  for (const st of strokes) {
+    const r = renames.get(`${st.session}|${st.figure}`);
+    if (r) { if (st.parts) st.parts = st.parts.map((id) => (id === `fig-${st.figure}` ? `fig-${r}` : id)); st.figure = r; }
+  }
   for (const e of events) { const r = renames.get(`${e.session}|${e.figure}`); if (r) e.figure = r; }
   const sessions = [...(lm.sessions || [])];
   for (const ss of remote.sessions || []) if (!sessions.some((x) => x.id === ss.id)) sessions.push(ss);
   sessions.sort((a, b) => (a.started || '').localeCompare(b.started || ''));
   const newer = remoteNewer ? remote : lm;
+  // parts: union; the newer side wins for a part both know, and a removal on either side stays
+  const lp = lm.parts || {}, rp = remote.parts || {};
+  const parts = remoteNewer ? { ...lp, ...rp } : { ...rp, ...lp };
+  for (const id of Object.keys(parts)) {
+    const rm = [lp[id] && lp[id].removed_at, rp[id] && rp[id].removed_at].filter(Boolean);
+    if (rm.length) parts[id] = { ...parts[id], removed_at: Math.min(...rm) };
+  }
   const meta = {
     ...lm,
     title: newer.title || '', tags: newer.tags || [], notes: newer.notes || '',
     updated: remoteNewer ? remote.updated : lm.updated,
-    sessions, figure_count: Math.max(maxFig, lm.figure_count || 0, remote.figure_count || 0),
+    sessions, parts, figure_count: Math.max(maxFig, lm.figure_count || 0, remote.figure_count || 0),
     stroke_count: strokes.length,
   };
   return { meta, strokes, events, renames };
@@ -1264,6 +1337,7 @@ async function applyRemote(id, remote, md5, fileId) {
   const le = await DB.events(id);
   const { meta, strokes, events, renames } = mergeData(lm, ls, le, remote);
   strokes.forEach(normalizeStroke);
+  migrateFigures(meta, strokes);
   computeErasure(strokes);
   meta.erasure = 1;
   meta.drive = { ...(lm.drive || {}), json: fileId, md5 };
@@ -1271,7 +1345,6 @@ async function applyRemote(id, remote, md5, fileId) {
   if (S.meta && S.meta.id === id) {
     const added = strokes.length - S.strokes.length;
     S.meta = meta; S.strokes = strokes; S.redo = [];
-    if (S.figure != null) S.figure = renames.get(`${S.sessionId}|${S.figure}`) || S.figure;
     repaint(); updateTools();
     if (added > 0) toast(`Pulled ${added} stroke${added === 1 ? '' : 's'} from your other device.`);
   }
@@ -1282,6 +1355,7 @@ async function importRemote(file) {
   if (!m.id || !m.paper) throw new Error('That file is not a Natural Hand drawing.');
   const meta = { ...m, format: FORMAT, rev: 0, synced_rev: 0, synced_at: file.modifiedTime, drive: { json: file.id, md5: file.md5Checksum }, view: null, stroke_count: strokes.length, erasure: 1 };
   strokes.sort((a, b) => a.i - b.i).forEach((st) => { st.drawing = meta.id; normalizeStroke(st); });
+  migrateFigures(meta, strokes);
   computeErasure(strokes);
   events.forEach((e) => { e.drawing = meta.id; });
   await DB.replaceDrawing(meta, strokes, events);
@@ -1424,9 +1498,31 @@ async function doExport(share) {
  * Redraws the drawing in the order and at the speed it was made. Erased ink appears
  * and is then painted over when the eraser passes; undo and redo happen when they did.
  * "Skip pauses" shortens gaps longer than 1.5 s (thinking, breaks, other days). */
+/* Labelling in replay: the strokes drawn between "From here" and the current moment are
+ * selected (optionally only those inside a loop drawn on the page), shown in blue, and
+ * can be labelled as a part of any kind. */
+const HILITE = '#1b84b5';
+function inPoly(x, y, P) {
+  let c = false;
+  for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
+    const [xi, yi] = P[i], [xj, yj] = P[j];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) c = !c;
+  }
+  return c;
+}
+// a stroke is inside a loop when at least half of its samples are
+function strokeInLoop(st, P) {
+  const Q = st.samples, n = Q.length, step = Math.max(1, Math.floor(n / 40));
+  let a = 0, b = 0;
+  for (let i = 0; i < n; i += step) { b++; if (inPoly(Q[i][1], Q[i][2], P)) a++; }
+  return a * 2 >= b;
+}
+const loopBox = (P) => ({ x0: Math.min(...P.map((q) => q[0])), x1: Math.max(...P.map((q) => q[0])), y0: Math.min(...P.map((q) => q[1])), y1: Math.max(...P.map((q) => q[1])) });
+
 const Replay = {
   on: false, paper: null, items: [], toggles: [], events: [], strokes: [], total: 0, t: 0, playing: false, speed: 1, skip: true,
-  k: 0, partial: 0, ti: 0, hidden: new Set(), lastFrame: 0, raf: 0, sessions: new Map(),
+  k: 0, partial: 0, ti: 0, hidden: new Set(), lastFrame: 0, raf: 0, sessions: new Map(), byI: new Map(),
+  lab: false, from: 0, loop: null, drawingLoop: null, loopId: null, sel: [], fixed: null, fixedId: null,
   async open() {
     if (!S.meta || S.active || this.on) return;
     const strokes = S.strokes.filter((st) => st.samples.length).slice().sort((a, b) => a.t0 - b.t0);
@@ -1456,6 +1552,7 @@ const Replay = {
       cursor = it.rs + dur; prevEnd = st.t0 + dur;
       this.items.push(it); byI.set(st.i, it);
     }
+    this.byI = byI;
     this.total = cursor;
     this.toggles = this.events.map((e) => ({ at: this.realToReplay(e.t), i: e.stroke, type: e.type })).filter((x) => byI.has(x.i));
     // when an eraser lifts, the page is redrawn with what it erased removed
@@ -1482,8 +1579,96 @@ const Replay = {
     this.clear(); this.k = 0; this.partial = 0; this.ti = 0; this.hidden = new Set();
     while (this.ti < this.toggles.length && this.toggles[this.ti].at <= this.t) this.applyToggle(this.toggles[this.ti++]);
     this.draw(this.t);
+    if (this.lab) { this.select(); this.highlight(); }
     this.ui(); requestRender();
   },
+  setLab(on) {
+    if (on) this.pause();
+    this.lab = on; this.loop = null; this.drawingLoop = null; this.fixed = null; this.fixedId = null; this.from = 0;
+    $('#rp-lab').hidden = !on;
+    $('#rp-label').setAttribute('aria-pressed', String(on));
+    $('#rp-label').textContent = on ? 'Done labelling' : 'Label parts';
+    if (on) this.fillKinds();
+    this.seek(this.t);
+  },
+  fillKinds() {
+    const cur = $('#lab-kind').value || S.kind;
+    $('#lab-kind').innerHTML = kindsList().map((k) => `<option${k === cur ? ' selected' : ''}>${escHtml(k)}</option>`).join('');
+  },
+  select() {
+    if (this.fixed) { this.sel = this.fixed; return; }
+    const L = this.loop, lb = L && loopBox(L);
+    this.sel = [];
+    for (const it of this.items) {
+      if (it.rs > this.t) break;
+      const st = it.st;
+      if (st.tool === 'eraser' || it.rs < this.from || this.hidden.has(st.i)) continue;
+      if (L && !(boxesMeet(bboxOf(st), lb) && strokeInLoop(st, L))) continue;
+      this.sel.push(st);
+    }
+  },
+  // selected strokes in blue, as far as they are drawn at this moment
+  highlight() {
+    const ctx = this.paper.x, tau = this.t, done = new Set();
+    for (const it of this.items) if (it.st.tool === 'eraser' && it.rs + it.dur <= tau && !this.hidden.has(it.st.i)) done.add(it.st.i);
+    for (const st of this.sel) {
+      const it = this.byI.get(st.i);
+      if (!it || it.rs > tau) continue;
+      const m = Math.min(st.samples.length, this.countUpTo(st, tau - it.rs));
+      const cut = (st.erased || []).filter((r) => done.has(r[2]));
+      drawStroke(ctx, cut.length ? Object.assign(Object.create(st), { erased: cut }) : st, 0, m, cut.length > 0, HILITE);
+    }
+  },
+  labUi() {
+    const n = this.sel.length, f = (ms) => this.fmt(ms);
+    let msg;
+    if (this.fixed) {
+      const p = S.meta.parts[this.fixedId];
+      msg = `Showing ${p ? p.kind : 'a part'}: ${n} stroke${n === 1 ? '' : 's'}. Draw a loop or press From here to select something new.`;
+    } else if (this.t < this.from) msg = `The start point (${f(this.from)}) is after this moment. Move forward, or press From here.`;
+    else msg = `${n} stroke${n === 1 ? '' : 's'} selected, drawn ${f(this.from)} to ${f(this.t)}${this.loop ? ' inside your loop' : ''}. `
+      + (this.loop ? 'Tap the page to drop the loop.' : 'Draw a loop around the thing to leave the rest out.');
+    $('#lab-help').textContent = msg;
+    $('#lab-go').disabled = !n || !!this.fixed;
+  },
+  fromHere() { this.from = this.t; this.fixed = null; this.fixedId = null; this.seek(this.t); },
+  loopStart(e) { this.drawingLoop = [screenToDoc(e.clientX, e.clientY)]; this.loopId = e.pointerId; requestRender(); },
+  loopMove(e) { for (const ce of coalesced(e)) this.drawingLoop.push(screenToDoc(ce.clientX, ce.clientY)); requestRender(); },
+  loopEnd() {
+    const P = this.drawingLoop;
+    this.drawingLoop = null;
+    let len = 0;
+    for (let i = 1; i < P.length; i++) len += Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]);
+    // a tap (or a tiny scribble) drops the loop
+    this.loop = P.length >= 3 && len * S.ppmm * S.view.s > 30 ? P : null;
+    this.fixed = null; this.fixedId = null;
+    this.seek(this.t);
+  },
+  label() {
+    const kind = $('#lab-kind').value, sel = this.sel;
+    if (!sel.length || !kind || this.fixed) return;
+    ensureSession();
+    // nest it inside the smallest part that already holds all of these strokes
+    let parent = null, best = Infinity;
+    for (const [pid, ms] of partMembers()) if (ms.size < best && sel.every((st) => ms.has(st))) { parent = pid; best = ms.size; }
+    const id = newPartId();
+    S.meta.parts = S.meta.parts || {};
+    S.meta.parts[id] = { kind, parent, source: 'replay', session: S.sessionId, created: rnd(absNow(), 3) };
+    for (const st of sel) { st.parts = [...(st.parts || []), id]; saveStroke(st); }
+    logEvent('part_label', { part: id, kind, parent, strokes: sel.length });
+    markChanged();
+    toast(`${sel.length} stroke${sel.length === 1 ? '' : 's'} labelled ${kind}${parent ? `, inside ${S.meta.parts[parent].kind}` : ''}.`);
+    this.loop = null; this.from = this.t;
+    this.seek(this.t);
+  },
+  show(id) {
+    const ms = [...(partMembers().get(id) || [])].filter((st) => this.byI.has(st.i));
+    if (!ms.length) { toast('This part has no strokes left.'); return; }
+    if (!this.lab) this.setLab(true);
+    this.fixed = ms; this.fixedId = id; this.loop = null;
+    this.seek(Math.max(...ms.map((st) => { const it = this.byI.get(st.i); return it.rs + it.dur; })));
+  },
+  fmt(ms) { const t = Math.floor(ms / 1000); return t >= 3600 ? `${Math.floor(t / 3600)}:${pad2(Math.floor(t / 60) % 60)}:${pad2(t % 60)}` : `${Math.floor(t / 60)}:${pad2(t % 60)}`; },
   applyToggle(g) { if (g.type === 'undo') this.hidden.add(g.i); else if (g.type === 'redo') this.hidden.delete(g.i); },
   draw(tau) {
     const ctx = this.paper.x;
@@ -1525,8 +1710,14 @@ const Replay = {
     this.playing = true; this.lastFrame = 0; $('#rp-play').textContent = 'Pause';
     cancelAnimationFrame(this.raf); this.raf = requestAnimationFrame((n) => this.tick(n));
   },
-  pause() { this.playing = false; cancelAnimationFrame(this.raf); $('#rp-play').textContent = this.t >= this.total ? 'Play again' : 'Play'; },
+  pause() {
+    const was = this.playing;
+    this.playing = false; cancelAnimationFrame(this.raf); $('#rp-play').textContent = this.t >= this.total ? 'Play again' : 'Play';
+    if (was && this.lab && this.on) this.seek(this.t); // refresh the selection where playback stopped
+  },
   close() {
+    this.lab = false; this.loop = null; this.drawingLoop = null; this.fixed = null; this.fixedId = null;
+    $('#rp-lab').hidden = true; $('#rp-label').setAttribute('aria-pressed', 'false'); $('#rp-label').textContent = 'Label parts';
     this.pause(); this.on = false; this.paper = null;
     document.body.classList.remove('replaying');
     $('#replay-bar').hidden = true;
@@ -1542,6 +1733,13 @@ const Replay = {
     return { st: it.st };
   },
   drawCursor(ctx, k) {
+    const L = this.drawingLoop || this.loop;
+    if (this.lab && L && L.length > 1) {
+      ctx.save(); ctx.beginPath(); ctx.moveTo(L[0][0], L[0][1]);
+      for (const q of L) ctx.lineTo(q[0], q[1]);
+      if (!this.drawingLoop) ctx.closePath();
+      ctx.setLineDash([5 / k, 4 / k]); ctx.lineWidth = 1.5 / k; ctx.strokeStyle = HILITE; ctx.stroke(); ctx.restore();
+    }
     const c = this.current();
     if (!c || c.x == null) return;
     const r = 5 / k;
@@ -1551,17 +1749,59 @@ const Replay = {
     ctx.stroke();
   },
   ui() {
-    const fmt = (ms) => { const t = Math.floor(ms / 1000); return t >= 3600 ? `${Math.floor(t / 3600)}:${pad2(Math.floor(t / 60) % 60)}:${pad2(t % 60)}` : `${Math.floor(t / 60)}:${pad2(t % 60)}`; };
+    const fmt = (ms) => this.fmt(ms);
     $('#rp-seek').value = this.total ? Math.round((this.t / this.total) * 1000) : 0;
     $('#rp-time').textContent = `${fmt(this.t)} / ${fmt(this.total)}`;
     const c = this.current(), ss = c && this.sessions.get(c.st.session);
     const info = [];
     if (ss) info.push(`${ss.device ? ss.device.name : ''}, ${new Date(ss.started).toLocaleDateString()}`);
-    if (c && c.st.figure != null) info.push(`figure ${c.st.figure}`);
+    const kinds = c ? partsOf(c.st).map((id) => S.meta.parts[id].kind) : [];
+    if (kinds.length) info.push(kinds.join(' › '));
     if (c && c.st.tool === 'eraser') info.push('erasing');
     $('#rp-info').textContent = info.join(', ');
+    if (this.lab) this.labUi();
   },
 };
+
+/* ------------------------------------------------------------ parts list */
+const SOURCE_TEXT = { live: 'marked while drawing', replay: 'labelled in replay', figure: 'figure from an older version' };
+function openPartsList() {
+  if (!S.meta) return;
+  const members = partMembers(), kinds = kindsList();
+  const rows = Object.entries(S.meta.parts || {}).filter(([, p]) => !p.removed_at).map(([id, p]) => {
+    const ms = [...(members.get(id) || [])];
+    return { id, p, n: ms.length, first: ms.length ? Math.min(...ms.map((st) => st.t0)) : Infinity };
+  }).sort((a, b) => a.first - b.first);
+  $('#parts-empty').hidden = rows.length > 0;
+  $('#parts-list').innerHTML = rows.map(({ id, p, n }) => {
+    const par = p.parent && livePart(p.parent);
+    const opts = (kinds.includes(p.kind) ? kinds : [p.kind, ...kinds]).map((k) => `<option${k === p.kind ? ' selected' : ''}>${escHtml(k)}</option>`).join('');
+    return `<div class="item part"><div><select data-kind="${id}" aria-label="Kind">${opts}</select>`
+      + `<div class="meta">${n} stroke${n === 1 ? '' : 's'}, ${SOURCE_TEXT[p.source] || escHtml(p.source)}${par ? `, inside ${escHtml(par.kind)}` : ''}</div></div>`
+      + `<div class="acts">${Replay.on && n ? `<button class="btn" data-show="${id}">Show</button>` : ''}<button class="btn danger" data-rm="${id}">Remove</button></div></div>`;
+  }).join('');
+  if (!$('#parts-dlg').open) $('#parts-dlg').showModal();
+}
+function setPartKind(id, kind) {
+  const p = S.meta.parts[id];
+  if (!p || !kind || p.kind === kind) return;
+  p.kind = kind;
+  logEvent('part_kind', { part: id, kind });
+  markChanged(); updateTools();
+  if (Replay.lab) Replay.seek(Replay.t);
+}
+function removePart(id) {
+  const p = S.meta.parts[id];
+  if (!p || !confirm(`Remove this ${p.kind}? The strokes stay; only the label is taken back.`)) return;
+  p.removed_at = rnd(absNow(), 3);
+  logEvent('part_remove', { part: id, kind: p.kind });
+  const i = S.partStack.indexOf(id);
+  if (i >= 0) S.partStack.splice(i);
+  markChanged(); updateTools();
+  if (Replay.fixedId === id) { Replay.fixed = null; Replay.fixedId = null; }
+  openPartsList();
+  if (Replay.lab) Replay.seek(Replay.t);
+}
 
 /* ------------------------------------------------------------ life size */
 function lifeSize() {
@@ -1899,7 +2139,7 @@ const ICONS = {
   eraser: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M4 16.5 13.5 7l5 5L9 21.5H6L4 19.5z"/><path d="M9 11.5l5 5M10 21.5h10"/></svg>',
   undo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg>',
   redo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 14 5-5-5-5"/><path d="M20 9H10a6 6 0 0 0 0 12h3"/></svg>',
-  figure: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="6" r="3.2"/><circle cx="10.8" cy="5.8" r=".6" fill="currentColor"/><circle cx="13.2" cy="5.8" r=".6" fill="currentColor"/><path d="M12 9.5v7M8 12.5l4-1.5 4 1.5M12 16.5l-3 5M12 16.5l3 5"/></svg>',
+  part: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8M20 15v2.5a1.5 1.5 0 0 1-1.5 1.5H16M8 19H5.5A1.5 1.5 0 0 1 4 17.5V15"/><circle cx="12" cy="9.5" r="2.4"/><path d="M8.6 15.5c.7-1.8 1.9-2.7 3.4-2.7s2.7.9 3.4 2.7"/></svg>',
   fill: '<svg viewBox="0 0 24 24"><path d="M5 7c3-3 9-4 13-1 3 3 1 8-2 10-4 3-10 3-12-1-1.5-3-1-6 1-8z" fill="currentColor"/></svg>',
   fit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/><rect x="8" y="8" width="8" height="8" rx="1"/></svg>',
   menu: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>',
@@ -1910,7 +2150,7 @@ function buildRail() {
   $('#eraser-btn').innerHTML = ICONS.eraser;
   $('#undo-btn').innerHTML = ICONS.undo;
   $('#redo-btn').innerHTML = ICONS.redo;
-  $('#figure-btn').innerHTML = ICONS.figure + '<span class="badge" id="fig-badge"></span>';
+  $('#part-btn').innerHTML = ICONS.part + '<span class="lbl" id="part-lbl"></span><span class="badge top" id="part-depth"></span>';
   $('#fill-btn').innerHTML = ICONS.fill;
   $('#fit-btn').innerHTML = ICONS.fit;
   $('#menu-btn').innerHTML = ICONS.menu;
@@ -1945,20 +2185,62 @@ function updateTools() {
   $('#smooth-range').value = S.smoothing;
   $('#smooth-val').textContent = S.smoothing;
   $('#eraser-btn').setAttribute('aria-pressed', String(S.tool === 'eraser'));
-  $('#figure-btn').setAttribute('aria-pressed', String(S.figure != null));
-  $('#fig-badge').textContent = S.figure != null ? S.figure : '';
+  const op = S.meta ? openPart() : null;
+  $('#part-btn').setAttribute('aria-pressed', String(!!op));
+  $('#part-lbl').textContent = op ? op.kind : S.kind;
+  $('#part-depth').textContent = S.partStack.length > 1 ? S.partStack.length : '';
+  $('#part-btn').setAttribute('aria-label', op ? `End ${op.kind}. Hold to start a part inside it` : `Start a ${S.kind}. Hold to choose the kind`);
   $('#fill-btn').setAttribute('aria-pressed', String(S.fill));
   $('#undo-btn').disabled = !S.strokes.some((s) => !s.undone_at);
   $('#redo-btn').disabled = !S.redo.length;
 }
-function showNibs() {
-  const pop = $('#nib-pop'), r = $('#nib-btn').getBoundingClientRect();
+function placePop(pop, btn) {
+  const r = btn.getBoundingClientRect();
   pop.hidden = false;
   const pr = pop.getBoundingClientRect();
-  if (window.innerWidth > window.innerHeight) { pop.style.left = (r.right + 8) + 'px'; pop.style.top = Math.max(8, r.top) + 'px'; }
+  if (window.innerWidth > window.innerHeight) { pop.style.left = (r.right + 8) + 'px'; pop.style.top = Math.max(8, Math.min(r.top, window.innerHeight - pr.height - 8)) + 'px'; }
   else { pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - pr.width - 8)) + 'px'; pop.style.top = (r.top - pr.height - 8) + 'px'; }
 }
-function hideNibs() { $('#nib-pop').hidden = true; }
+function showNibs() { $('#part-pop').hidden = true; placePop($('#nib-pop'), $('#nib-btn')); }
+function hideNibs() { $('#nib-pop').hidden = true; $('#part-pop').hidden = true; }
+// the part button's menu: choose a kind (starts a part, inside the open one if any)
+function showParts() {
+  if (!S.meta) return;
+  hideNibs();
+  const op = openPart();
+  $('#part-title').textContent = op ? `Start a part inside ${op.kind}` : 'Start a part';
+  $('#kind-list').innerHTML = kindsList().map((k) => `<button role="menuitem" data-k="${escHtml(k)}" aria-pressed="${k === S.kind}">${escHtml(k)}</button>`).join('');
+  $('#part-end').hidden = !op;
+  if (op) $('#part-end').textContent = `End ${op.kind}`;
+  placePop($('#part-pop'), $('#part-btn'));
+}
+// tap and hold (or right-click) on one button
+function bindHold(btn, onTap, onHold) {
+  let timer = 0, held = false;
+  btn.addEventListener('pointerdown', (e) => { held = false; clearTimeout(timer); if (e.button === 0) timer = setTimeout(() => { held = true; onHold(); }, 450); });
+  for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) btn.addEventListener(ev, () => clearTimeout(timer));
+  btn.addEventListener('contextmenu', (e) => { e.preventDefault(); clearTimeout(timer); if (!held) onHold(); });
+  btn.addEventListener('click', () => { if (held) { held = false; return; } onTap(); });
+}
+function renderKinds() {
+  $('#kinds-list').innerHTML = loadKinds().map((k) => `<div class="krow"><span>${escHtml(k)}</span><button class="btn" data-del="${escHtml(k)}">Remove</button></div>`).join('');
+}
+function openKinds() { hideNibs(); renderKinds(); $('#kind-new').value = ''; $('#kinds-dlg').showModal(); }
+function addKind() {
+  const v = $('#kind-new').value.trim().replace(/\s+/g, ' ').slice(0, 30);
+  if (!v) return;
+  const ks = loadKinds();
+  if (!ks.some((k) => k.toLowerCase() === v.toLowerCase())) { ks.push(v); saveKinds(ks); }
+  $('#kind-new').value = '';
+  renderKinds();
+}
+function removeKind(name) {
+  const ks = loadKinds().filter((k) => k !== name);
+  if (!ks.length) { toast('Keep at least one kind.'); return; }
+  saveKinds(ks);
+  if (S.kind === name) { S.kind = ks[0]; localStorage.setItem('nh-kind', S.kind); updateTools(); }
+  renderKinds();
+}
 
 let toastTimer = 0;
 function toast(msg) {
@@ -1998,7 +2280,7 @@ function openMenu() {
   drawFeelCurve();
   $('#m-diag').checked = S.diag;
   $('#menu-title').textContent = m ? (m.title || m.id) : 'Drawing';
-  $('#m-foot').textContent = `Natural Hand ${APP_VERSION}. ${m ? `${m.stroke_count || 0} strokes, ${m.figure_count || 0} figures in this drawing.` : ''}`;
+  $('#m-foot').textContent = `Natural Hand ${APP_VERSION}. ${m ? `${m.stroke_count || 0} strokes, ${Object.values(m.parts || {}).filter((p) => !p.removed_at).length} parts in this drawing.` : ''}`;
   if (navigator.storage && navigator.storage.estimate) navigator.storage.estimate().then((est) => {
     $('#m-foot').textContent += ` Using ${(est.usage / 1048576).toFixed(1)} MB on this device.`;
   });
@@ -2129,7 +2411,14 @@ function bindUI() {
   $('#eraser-btn').onclick = toggleEraser;
   $('#undo-btn').onclick = undo;
   $('#redo-btn').onclick = redo;
-  $('#figure-btn').onclick = toggleFigure;
+  bindHold($('#part-btn'), () => togglePart('button'), showParts);
+  $('#kind-list').onclick = (e) => { const b = e.target.closest('button'); if (b) { hideNibs(); startPart(b.dataset.k, 'menu'); } };
+  $('#part-end').onclick = () => { hideNibs(); endPart('menu'); };
+  $('#kinds-edit').onclick = openKinds;
+  $('#kind-add').onclick = addKind;
+  $('#kind-new').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addKind(); } });
+  $('#kinds-list').onclick = (e) => { const b = e.target.closest('[data-del]'); if (b) removeKind(b.dataset.del); };
+  $('#kinds-close').onclick = () => { $('#kinds-dlg').close(); if (Replay.lab) Replay.fillKinds(); };
   $('#fill-btn').onclick = toggleFill;
   $('#fit-btn').onclick = fit;
   $('#menu-btn').onclick = openMenu;
@@ -2166,6 +2455,20 @@ function bindUI() {
   $('#zoom-chip').onclick = lifeSize;
   $('#rp-play').onclick = () => (Replay.playing ? Replay.pause() : Replay.play());
   $('#rp-close').onclick = () => Replay.close();
+  $('#rp-label').onclick = () => Replay.setLab(!Replay.lab);
+  $('#lab-from').onclick = () => Replay.fromHere();
+  $('#lab-go').onclick = () => Replay.label();
+  $('#lab-list').onclick = () => openPartsList();
+  $('#m-parts').onclick = () => { $('#menu').close(); openPartsList(); };
+  $('#parts-list').addEventListener('change', (e) => { const el = e.target.closest('[data-kind]'); if (el) setPartKind(el.dataset.kind, el.value); });
+  $('#parts-list').onclick = (e) => {
+    const sh = e.target.closest('[data-show]');
+    if (sh) { $('#parts-dlg').close(); Replay.show(sh.dataset.show); return; }
+    const rm = e.target.closest('[data-rm]');
+    if (rm) removePart(rm.dataset.rm);
+  };
+  $('#parts-close').onclick = () => $('#parts-dlg').close();
+  $('#parts-kinds').onclick = () => { $('#parts-dlg').close(); openKinds(); };
   $('#rp-seek').oninput = (e) => { Replay.pause(); Replay.seek((Number(e.target.value) / 1000) * Replay.total); };
   $('#rp-speed').onchange = (e) => { Replay.speed = Number(e.target.value); };
   $('#rp-skip').onchange = (e) => { const frac = Replay.total ? Replay.t / Replay.total : 0; Replay.skip = e.target.checked; Replay.build(); Replay.seek(frac * Replay.total); };
@@ -2206,7 +2509,7 @@ function bindUI() {
     const k = e.key.toLowerCase(), mod = e.ctrlKey || e.metaKey;
     if (Replay.on) {
       if (k === ' ') { e.preventDefault(); Replay.playing ? Replay.pause() : Replay.play(); }
-      else if (k === 'escape') Replay.close();
+      else if (k === 'escape') { if (Replay.lab) Replay.setLab(false); else Replay.close(); }
       else if (k === '0') fit();
       return;
     }
@@ -2219,7 +2522,7 @@ function bindUI() {
     else if (k === '[') setSmoothing(S.smoothing - 10);
     else if (k === ']') setSmoothing(S.smoothing + 10);
     else if (k === 'e') toggleEraser();
-    else if (k === 'f') toggleFigure();
+    else if (k === 'f') { if (e.shiftKey) showParts(); else togglePart('key'); }
     else if (k === 'g') toggleFill();
     else if (k === '0') fit();
     else if (k === 'l') lifeSize();
@@ -2290,7 +2593,7 @@ async function init() {
 }
 
 // test hook (used by automated checks; harmless in normal use)
-window.__nh = { S, buildExport, undo, redo, toggleFigure, fit, Drive, syncAll, mergeData, Replay, Video };
+window.__nh = { S, buildExport, undo, redo, togglePart, startPart, endPart, migrateFigures, partMembers, fit, Drive, syncAll, mergeData, Replay, Video };
 
 init();
 })();

@@ -56,22 +56,31 @@ Then open the menu, turn on **Show live pen data**, and draw a few lines. The pa
 | Smoothing (0 to 100) | slider under the widths | [ and ] |
 | Eraser: whole lines or cut through | eraser button, or the Wacom eraser end | E |
 | Undo / redo | arrows | Ctrl+Z / Ctrl+Shift+Z |
-| Mark a figure | figure button, or the pen's side button; press again when the figure is done | F |
+| Start / end a part (figure, head, structure...) | part button, or the pen's side button; press again when it is done | F |
+| Choose the kind of part, or start one inside another | hold the part button (or right-click it) | Shift+F |
 | Mark black fill | fill button | G |
 | Move, zoom, rotate page | one or two fingers | Space+drag, wheel, Shift+wheel |
 | Fit page | fit button | 0 |
 | Life size (1:1) | zoom chip at the top | L |
 | Replay | menu, Replay | R, then Space to pause, Esc to close |
+| Label parts afterwards | Replay, Label parts | |
+| See, rename or remove parts | menu, Parts (or Parts in replay labelling) | |
 | Replay video | menu, Export video | |
 | Live pen data | menu | D |
 
 Finger touches are ignored for a moment after the pen was near the screen, so a resting palm does not move the page. You can switch finger navigation off in the menu.
 
-**Mark your figures.** Press the figure button when you start a body and again when it is finished. Every stroke in between gets that figure's number. This is how the generator will learn your figures as their own thing, so it is worth the second it takes. Mark solid black fills the same way, so scrubbing strokes do not distort the speed and pressure statistics.
+**Mark parts.** A part is one thing in the drawing: a figure, a head, a mass, a shell, a ribbed form, whatever you call it. Press the part button when you start one and again when it is finished; every stroke in between belongs to it. The small word under the button is the kind it will start. Hold the button to choose another kind. If a part is already open, the one you choose starts inside it (a head inside a figure, a figure inside a mass), and the next press ends the inner one. A part ended with nothing drawn in it is not kept. This is how the generator will learn your figures and structures as their own things, so it is worth the second it takes.
+
+**Kinds.** Hold the part button, then Edit kinds, to make the list your own words. The list lives on each device; parts you already marked keep their kind. Mark only what something *is* here. How it is drawn (stipple, fringe, hatching, drips) can be found from the movement itself later, so there is no need to label it.
+
+**Label afterwards.** In replay, press Label parts. Scrub to where a thing starts and press From here, then scrub to where it ends: everything drawn in between turns blue. Draw a loop around the thing on the page to leave out what is nearby; tap the page to drop the loop. Choose the kind and press Label. The next selection starts where the last one ended, so you can work through a drawing in order. A part labelled inside another is stored as inside it. Parts (in the labelling row, or in the menu) lists every part: change its kind, show its strokes, or remove it. Removing only takes the label back; strokes are never changed.
+
+**Mark black fills** with the fill button, so scrubbing strokes do not distort the speed and pressure statistics.
 
 Undo never deletes data: undone strokes stay in the file, marked with the time they were undone.
 
-**Pen side button.** On the S Pen, press the side button while the pen hovers to start a figure, and again to finish it. The phone gives a short buzz. On the Wacom, the lower barrel button does the same when it is set to right-click (the default). You can turn this off in the menu.
+**Pen side button.** On the S Pen, press the side button while the pen hovers to start a part, and again to finish it. The phone gives a short buzz. On the Wacom, the lower barrel button does the same when it is set to right-click (the default). You can turn this off in the menu.
 
 **Life size.** The zoom chip at the top shows the zoom. Tap it to see the page at real size (100% means 1 mm on screen is 1 mm on paper, if the device is calibrated); tap again to fit the page. Drawing mostly at life size keeps your hand movements comparable between drawings.
 
@@ -106,7 +115,7 @@ One file per drawing: `<id>.json.gz` in Drive (plain `<id>.json` from Download J
   "sessions": [ { "id", "started", "device": { "name", "ppmm", ... }, "screen", "user_agent" } ],
   "sample_fields": ["dt_ms","x_mm","y_mm","pressure","tiltX","tiltY","twist","altitude","azimuth","tangential","width_px","height_px","buttons"],
   "strokes": [ {
-      "i", "session", "t0" (epoch ms), "tool", "width_mm", "figure", "tags", "pointer_type",
+      "i", "session", "t0" (epoch ms), "tool", "width_mm", "parts": [part ids], "tags", "pointer_type",
       "view": [zoom, rotation_rad, tx, ty], "ppmm",
       "hover": [ [dt_ms (negative), x_mm, y_mm, ...], ... ],
       "samples": [ [dt_ms, x_mm, y_mm, pressure, ...], ... ],   (the drawn, smoothed path)
@@ -114,10 +123,13 @@ One file per drawing: `<id>.json.gz` in Drive (plain `<id>.json` from Download J
       "brush", "smoothing", "smoothing_tau_ms", "pressure_gamma", "prompt", "erased": [[first, last, eraser_i], ...],
       "undone_at", "cancelled"
   } ],
+  "parts": { "<id>": { "kind", "parent" (id or null), "source": "live" | "replay" | "figure", "session", "created", "removed_at"? } },
   "prompts": [ { "id", "text", "minutes", "started", "ended" } ],
-  "events": [ { "t", "type": "undo" | "redo" | "figure_start" | "figure_end" | "fill_start" | "fill_end" | "prompt_start" | "prompt_end" | "away_start" | "away_end", ... } ]
+  "events": [ { "t", "type": "undo" | "redo" | "part_start" | "part_end" | "part_label" | "part_kind" | "part_remove" | "fill_start" | "fill_end" | "prompt_start" | "prompt_end" | "away_start" | "away_end", ... } ]
 }
 ```
+
+A stroke lists every part it belongs to; nesting is in each part's `parent`. Parts with `removed_at` were taken back and should be ignored. Drawings from before parts existed have a `figure` number on strokes; these open as parts `fig-N` of kind Figure, and the number is kept.
 
 Positions are paper millimetres from the top-left corner. Every coalesced sample the device delivers is kept, with no resampling; `raw` (or `samples` when smoothing was 0) is exactly what the device reported. The last sample of each stroke is the pen-up event (pressure 0). Each stroke carries the page view at that moment, so its screen-space and physical movement can be reconstructed: `screen_px = R(rotation) * (mm * ppmm * zoom) + (tx, ty)`.
 

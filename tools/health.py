@@ -30,7 +30,7 @@ class Device:
         self.drawings = set()
         self.sessions = {}
         self.strokes = 0
-        self.undone = self.erasers = self.cancelled = self.figure = self.fill = self.smoothed = 0
+        self.undone = self.erasers = self.cancelled = self.in_part = self.fill = self.smoothed = 0
         self.with_hover = 0
         self.hover_dropped = 0
         self.pointer = Counter()
@@ -52,7 +52,7 @@ class Device:
         self.undone += st.undone
         self.erasers += st.tool == "eraser"
         self.cancelled += st.cancelled
-        self.figure += st.figure is not None
+        self.in_part += bool(st.parts) or st.figure is not None
         self.fill += "fill" in (st.tags or [])
         self.smoothed += st.smoothing_tau_ms > 0
         self.hover_dropped += st.hover_dropped
@@ -187,7 +187,7 @@ def checks(dev):
         out.append((INFO, "Movement", f"median step {np.median(s):.2f} mm between samples; "
                     f"median speed {np.median(dev.speed):.0f} mm/s, fast strokes up to {pct(dev.speed, 99):.0f} mm/s.", ""))
     out.append((INFO, "Content", f"{pen} pen strokes, {dev.erasers} eraser strokes, {dev.undone} undone, {dev.cancelled} cancelled; "
-                f"{dev.figure} in figures, {dev.fill} tagged fill, {dev.smoothed} smoothed. "
+                f"{dev.in_part} in parts, {dev.fill} tagged fill, {dev.smoothed} smoothed. "
                 f"{dev.draw_ms / 60000:.1f} min with the pen down. Pointer types: "
                 + ", ".join(f"{k} {v}" for k, v in dev.pointer.most_common()) + ".", ""))
     versions = sorted({s.get("app_version", "?") for s in dev.sessions.values()})
