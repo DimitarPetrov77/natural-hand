@@ -8,12 +8,12 @@
 'use strict';
 (() => {
 
-const APP_VERSION = '0.4.0';
+const APP_VERSION = '0.5.1';
 const FORMAT = 'natural-hand/1';
 const SAMPLE_FIELDS = ['dt_ms','x_mm','y_mm','pressure','tiltX','tiltY','twist','altitude','azimuth','tangential','width_px','height_px','buttons'];
-const PAPERS = { A5:[148,210], A4:[210,297], A3:[297,420] };
+const PAPERS = { A5: [148, 210], A4: [210, 297], A3: [297, 420], A2: [420, 594], A1: [594, 841], Square: [300, 300] };
+const ENDLESS_PAD = 150, ENDLESS_MARGIN = 25; // mm of room added around ink on endless pages
 const NIBS = [0.1, 0.2, 0.3, 0.5, 0.8, 1.2, 2.0];
-const ERASERS = [0.5, 1, 2, 4, 8];
 const BRUSHES = {
   technical: { label: 'Technical', width: () => 1 },
   ink:       { label: 'Ink pen',   width: (p) => 0.5 + 0.8 * p },
@@ -110,11 +110,11 @@ const S = {
   meta: null,          // current drawing metadata
   strokes: [],         // current drawing strokes (index = stroke.i)
   paper: null,         // {c, x, K} bitmap of the sheet
-  paperSize: [210, 297],
+  endless: false,
   view: { s: 1, r: 0, tx: 0, ty: 0 },
   tool: 'pen',
   width: 0.3,
-  eraserWidth: 2,
+  eraseMode: 'stroke',     // 'stroke' deletes whole lines, 'cut' cuts through them
   brush: 'technical',
   smoothing: 0,
   figure: null,
@@ -127,6 +127,8 @@ const S = {
   sessionLogged: false,
   lastPen: -1e9,
   touchNav: localStorage.getItem('nh-touch') !== '0',
+  penButtonFigure: localStorage.getItem('nh-penbtn') !== '0',
+  prompt: null,
   diag: localStorage.getItem('nh-diag') === '1',
 };
 
@@ -148,19 +150,21 @@ let renderQueued = false;
 function requestRender() { if (!renderQueued) { renderQueued = true; requestAnimationFrame(render); } }
 function render() {
   renderQueued = false;
+  updateZoomChip();
   vctx.setTransform(1, 0, 0, 1, 0, 0);
-  if (S.paper && sharpKey === viewKey()) { vctx.drawImage(sharp, 0, 0); return; }
-  vctx.fillStyle = surround;
+  if (S.paper && !Replay.on && sharpKey === viewKey()) { vctx.drawImage(sharp, 0, 0); return; }
+  vctx.fillStyle = S.paper && S.endless ? '#ffffff' : surround;
   vctx.fillRect(0, 0, view.width, view.height);
   if (!S.paper) return;
-  const v = S.view, k = S.ppmm * v.s, [W, H] = S.paperSize;
+  const v = S.view, k = S.ppmm * v.s, pp = Replay.on ? Replay.paper : S.paper, b = pp.b;
   vctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   vctx.translate(v.tx, v.ty);
   vctx.rotate(v.r);
   vctx.scale(k, k);
   vctx.imageSmoothingEnabled = true;
   vctx.imageSmoothingQuality = 'high';
-  vctx.drawImage(S.paper.c, 0, 0, W, H);
+  vctx.drawImage(pp.c, b.x0, b.y0, b.w, b.h);
+  if (Replay.on) { Replay.drawCursor(vctx, k); return; }
   scheduleSharp();
 }
 
@@ -194,18 +198,18 @@ function visibleDocRect() {
   const c = [screenToDoc(0, 0), screenToDoc(cw, 0), screenToDoc(0, ch), screenToDoc(cw, ch)];
   return { x0: Math.min(...c.map((p) => p[0])), x1: Math.max(...c.map((p) => p[0])), y0: Math.min(...c.map((p) => p[1])), y1: Math.max(...c.map((p) => p[1])) };
 }
-function clipPaper(ctx) { const [W, H] = S.paperSize; ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip(); }
+function clipPaper(ctx) { if (S.endless) return; const b = S.paper.b; ctx.beginPath(); ctx.rect(b.x0, b.y0, b.w, b.h); ctx.clip(); }
 function renderSharp() {
-  if (!S.paper) return;
+  if (!S.paper || Replay.on) return;
   if (gesture || mousePan) { scheduleSharp(); return; }
   if (sharp.width !== view.width || sharp.height !== view.height) { sharp.width = view.width; sharp.height = view.height; }
   sctx.setTransform(1, 0, 0, 1, 0, 0);
-  sctx.fillStyle = surround;
+  sctx.fillStyle = S.endless ? '#ffffff' : surround;
   sctx.fillRect(0, 0, sharp.width, sharp.height);
   applyView(sctx);
-  const [W, H] = S.paperSize;
+  const pb = S.paper.b;
   sctx.fillStyle = '#ffffff';
-  sctx.fillRect(0, 0, W, H);
+  if (!S.endless) sctx.fillRect(pb.x0, pb.y0, pb.w, pb.h);
   sctx.save(); clipPaper(sctx);
   const r = visibleDocRect();
   for (const st of S.strokes) {
@@ -245,27 +249,63 @@ function snapRot(r) {
 }
 function fit() {
   if (!S.meta) return;
-  const [W, H] = S.paperSize, pad = 24;
+  const b = S.endless ? (contentBox(S.strokes, 15) || { x0: -100, y0: -140, w: 200, h: 280 }) : S.paper.b, pad = 24;
   const rr = $('#rail').getBoundingClientRect();
   let L = 0, B = 0;
   if (rr.height > rr.width) L = rr.right; else B = ch - rr.top;
   const aw = cw - L - pad * 2, ah = ch - B - pad * 2 - 30;
-  const s = Math.max(0.02, Math.min(aw / (W * S.ppmm), ah / (H * S.ppmm)));
+  const s = clamp(Math.min(aw / (b.w * S.ppmm), ah / (b.h * S.ppmm)), 0.02, 4);
   const k = S.ppmm * s;
-  S.view = { s, r: 0, tx: L + pad + (aw - W * k) / 2, ty: pad + 30 + (ah - H * k) / 2 };
+  S.view = { s, r: 0, tx: L + pad + (aw - b.w * k) / 2 - b.x0 * k, ty: pad + 30 + (ah - b.h * k) / 2 - b.y0 * k };
   persistViewSoon();
   requestRender();
 }
 
 /* ------------------------------------------------------------ paper ink */
-function makePaper(W, H) {
-  const K = Math.min(MAX_BITMAP / W, MAX_BITMAP / H, 16);
+function makePaper(b) {
+  const K = Math.min(MAX_BITMAP / b.w, MAX_BITMAP / b.h, 16);
   const c = document.createElement('canvas');
-  c.width = Math.round(W * K); c.height = Math.round(H * K);
-  const x = c.getContext('2d');
-  return { c, x, K };
+  c.width = Math.max(1, Math.round(b.w * K)); c.height = Math.max(1, Math.round(b.h * K));
+  return { c, x: c.getContext('2d'), K, b };
 }
-function inkOf(st) { return st.tool === 'eraser' ? '#ffffff' : '#000000'; }
+function contentBox(strokes, pad = 0) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const st of strokes) {
+    if (st.undone_at || st.tool === 'eraser' || !st.samples.length) continue;
+    const b = bboxOf(st);
+    if (b.x0 < x0) x0 = b.x0; if (b.y0 < y0) y0 = b.y0; if (b.x1 > x1) x1 = b.x1; if (b.y1 > y1) y1 = b.y1;
+  }
+  if (x0 === Infinity) return null;
+  return { x0: x0 - pad, y0: y0 - pad, w: x1 - x0 + pad * 2, h: y1 - y0 + pad * 2 };
+}
+// endless pages: grow the page (in 50 mm steps) when ink comes near its edge
+function growTo(b, c) {
+  if (c.x0 >= b.x0 + ENDLESS_MARGIN && c.y0 >= b.y0 + ENDLESS_MARGIN && c.x0 + c.w <= b.x0 + b.w - ENDLESS_MARGIN && c.y0 + c.h <= b.y0 + b.h - ENDLESS_MARGIN) return b;
+  const snap = (v, f) => f(v / 50) * 50;
+  const x0 = snap(Math.min(b.x0, c.x0 - ENDLESS_PAD), Math.floor), y0 = snap(Math.min(b.y0, c.y0 - ENDLESS_PAD), Math.floor);
+  const x1 = snap(Math.max(b.x0 + b.w, c.x0 + c.w + ENDLESS_PAD), Math.ceil), y1 = snap(Math.max(b.y0 + b.h, c.y0 + c.h + ENDLESS_PAD), Math.ceil);
+  return { x0, y0, w: x1 - x0, h: y1 - y0 };
+}
+function boundsOfMeta(meta, strokes) {
+  const p = meta.paper;
+  if (!p.endless) return { x0: 0, y0: 0, w: p.w_mm, h: p.h_mm };
+  const b = { x0: p.x0 ?? -200, y0: p.y0 ?? -200, w: p.w_mm || 400, h: p.h_mm || 400 };
+  const c = contentBox(strokes);
+  return c ? growTo(b, c) : b;
+}
+function maybeExtend() {
+  if (!S.endless) return;
+  const c = contentBox(S.strokes);
+  if (!c) return;
+  const nb = growTo(S.paper.b, c);
+  if (nb === S.paper.b) return;
+  S.paper = makePaper(nb);
+  Object.assign(S.meta.paper, { x0: nb.x0, y0: nb.y0, w_mm: nb.w, h_mm: nb.h });
+  repaint();
+}
+// a whole-line eraser shows a light trail while you drag; a cutting eraser paints white
+const eraseModeOf = (st) => st.erase_mode || 'cut';
+function inkOf(st) { return st.tool !== 'eraser' ? '#000000' : eraseModeOf(st) === 'stroke' ? '#a4dded' : '#ffffff'; }
 /* Smoothing: `raw` keeps exactly what the device reported; `samples` is the smoothed
  * path that is drawn and analysed. Positions pass through a time-based exponential
  * filter (time constant smoothing_tau_ms), so a level feels the same on every device.
@@ -302,7 +342,7 @@ function widthsOf(st) {
     if (c.p == null) c.p = p;
     else { const a = 1 - Math.exp(-Math.max(0, r[0] - c.t) / 12); c.p += (p - c.p) * a; }
     c.t = r[0];
-    c.w.push(Math.max(0.02, st.width_mm * fn(clamp(c.p, 0, 1))));
+    c.w.push(Math.max(0.02, st.width_mm * fn(Math.pow(clamp(c.p, 0, 1), st.pressure_gamma || 1))));
   }
   c.n = n;
   return c.w;
@@ -318,44 +358,62 @@ function erasedMask(st) {
   EM.set(st, { src: st.erased, n: st.samples.length, mask });
   return mask;
 }
-function drawStroke(ctx, st, from = 0) {
-  const P = st.samples, n = P.length;
-  if (!n) return;
+// the drawable pieces of a stroke: a start dot and runs of points sharing one width
+function strokeRuns(st, from = 0, to = st.samples.length, useMask = true) {
+  const P = st.samples, n = Math.min(to, P.length), runs = [];
+  let dot = null;
+  if (!n) return { dot, runs };
   const eraser = st.tool === 'eraser';
   const W = eraser || st.brush === 'technical' ? null : widthsOf(st);
-  const M = eraser ? null : erasedMask(st);
-  const wAt = (i) => (W ? W[i] : st.width_mm);
+  const M = eraser || !useMask ? null : erasedMask(st);
+  if (from === 0 && !(M && M[0])) dot = [P[0][1], P[0][2], (W ? W[0] : st.width_mm) / 2];
+  const q = st.width_mm * 0.04;
+  let run = null;
+  for (let i = Math.max(1, from); i < n; i++) {
+    if (M && (M[i] || M[i - 1])) { run = null; continue; }
+    const w = W ? Math.max(0.02, Math.round(((W[i - 1] + W[i]) / 2) / q) * q) : st.width_mm;
+    if (!run || run.w !== w) { run = { w, pts: [[P[i - 1][1], P[i - 1][2]]] }; runs.push(run); }
+    run.pts.push([P[i][1], P[i][2]]);
+  }
+  return { dot, runs };
+}
+function drawStroke(ctx, st, from = 0, to = undefined, useMask = true) {
+  const { dot, runs } = strokeRuns(st, from, to ?? st.samples.length, useMask);
   ctx.strokeStyle = ctx.fillStyle = inkOf(st);
   ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-  if (from === 0 && !(M && M[0])) {
-    ctx.beginPath(); ctx.arc(P[0][1], P[0][2], wAt(0) / 2, 0, Math.PI * 2); ctx.fill();
+  if (dot) { ctx.beginPath(); ctx.arc(dot[0], dot[1], dot[2], 0, Math.PI * 2); ctx.fill(); }
+  for (const r of runs) {
+    ctx.beginPath(); ctx.lineWidth = r.w;
+    ctx.moveTo(r.pts[0][0], r.pts[0][1]);
+    for (let k = 1; k < r.pts.length; k++) ctx.lineTo(r.pts[k][0], r.pts[k][1]);
+    ctx.stroke();
   }
-  const a = Math.max(1, from);
-  if (a >= n) return;
-  // consecutive segments with the same (quantized) width share one path
-  let open = false, cw = -1;
-  const q = st.width_mm * 0.04;
-  for (let i = a; i < n; i++) {
-    if (M && (M[i] || M[i - 1])) { if (open) { ctx.stroke(); open = false; } continue; }
-    const w = W ? Math.max(0.02, Math.round(((W[i - 1] + W[i]) / 2) / q) * q) : st.width_mm;
-    if (!open || w !== cw) {
-      if (open) ctx.stroke();
-      ctx.beginPath(); ctx.lineWidth = w; cw = w; ctx.moveTo(P[i - 1][1], P[i - 1][2]); open = true;
-    }
-    ctx.lineTo(P[i][1], P[i][2]);
-  }
-  if (open) ctx.stroke();
 }
 const visibleInk = (st) => !st.undone_at && (st.tool !== 'eraser' || (S.active && S.active.st === st));
 
 /* Vector eraser: an eraser stroke marks the samples of earlier strokes that it passes
  * over (st.erased = [[from, to, eraser_i], ...]). The ink data stays, marked as erased,
  * so undoing the eraser brings it back and the history of corrections is kept. */
+function ptSeg(px, py, A, B) {
+  const dx = B[1] - A[1], dy = B[2] - A[2], L = dx * dx + dy * dy;
+  const t = L ? clamp(((px - A[1]) * dx + (py - A[2]) * dy) / L, 0, 1) : 0;
+  return Math.hypot(px - (A[1] + t * dx), py - (A[2] + t * dy));
+}
+function segSeg(p, q, A, B) {
+  const o = (a, b, c) => Math.sign((b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]));
+  if (o(p, q, A) * o(p, q, B) < 0 && o(A, B, p) * o(A, B, q) < 0) return 0;
+  return Math.min(ptSeg(p[1], p[2], A, B), ptSeg(q[1], q[2], A, B), ptSeg(A[1], A[2], [0, p[1], p[2]], [0, q[1], q[2]]), ptSeg(B[1], B[2], [0, p[1], p[2]], [0, q[1], q[2]]));
+}
 function computeErasure(strokes) {
   const result = new Map();
   for (const E of strokes) {
     if (E.tool !== 'eraser' || E.undone_at || !E.samples.length) continue;
-    const r = E.width_mm / 2, eb = bboxOf(E), cell = Math.max(r * 2, 0.5), grid = new Map();
+    const whole = eraseModeOf(E) === 'stroke';
+    // reach: the eraser's half width plus up to 2 mm for the touched line's own width;
+    // whole-line erasing gets at least 0.75 mm so thin lines are easy to hit
+    const reach = E.width_mm / 2 + 2;
+    const r0 = E.width_mm / 2, eb0 = bboxOf(E), eb = { x0: eb0.x0 - 2, y0: eb0.y0 - 2, x1: eb0.x1 + 2, y1: eb0.y1 + 2 };
+    const cell = Math.max(reach * 2, 0.5), grid = new Map(), r = reach;
     const key = (cx, cy) => cx * 100003 + cy;
     const segs = E.samples.length === 1 ? [[0, 0]] : E.samples.slice(1).map((_, i) => [i, i + 1]);
     for (const [i0, i1] of segs) {
@@ -370,19 +428,36 @@ function computeErasure(strokes) {
       if (T.tool === 'eraser' || T.undone_at || T.t0 >= E.t0) continue;
       const tb = bboxOf(T);
       if (tb.x1 < eb.x0 || tb.x0 > eb.x1 || tb.y1 < eb.y0 || tb.y0 > eb.y1) continue;
-      const hit = [];
-      T.samples.forEach((p, idx) => {
-        const list = grid.get(key(Math.floor(p[1] / cell), Math.floor(p[2] / cell)));
-        if (!list) return;
-        for (const [A, B] of list) {
-          const dx = B[1] - A[1], dy = B[2] - A[2], L = dx * dx + dy * dy;
-          const t = L ? clamp(((p[1] - A[1]) * dx + (p[2] - A[2]) * dy) / L, 0, 1) : 0;
-          if (Math.hypot(p[1] - (A[1] + t * dx), p[2] - (A[2] + t * dy)) <= r) { hit.push(idx); break; }
+      // a sample is erased if it lies under the eraser; a segment the eraser crosses
+      // between two samples (fast, sparse strokes) loses its endpoint nearest the eraser
+      const hitSet = new Set(), TS = T.samples;
+      const rr = whole ? Math.max(0.75, r0 + T.width_mm / 2) : r0 + T.width_mm / 2;
+      const cellsOf = (ax, ay, bx, by) => {
+        const out = new Set();
+        const x0 = Math.floor(Math.min(ax, bx) / cell), x1 = Math.floor(Math.max(ax, bx) / cell);
+        const y0 = Math.floor(Math.min(ay, by) / cell), y1 = Math.floor(Math.max(ay, by) / cell);
+        if ((x1 - x0 + 1) * (y1 - y0 + 1) > 400) return null;
+        for (let cx = x0; cx <= x1; cx++) for (let cy = y0; cy <= y1; cy++) { const l = grid.get(key(cx, cy)); if (l) for (const sg of l) out.add(sg); }
+        return out;
+      };
+      for (let idx = 0; idx < TS.length; idx++) {
+        const p = TS[idx], list = grid.get(key(Math.floor(p[1] / cell), Math.floor(p[2] / cell)));
+        if (list && list.some(([A, B]) => ptSeg(p[1], p[2], A, B) <= rr)) hitSet.add(idx);
+      }
+      for (let idx = 1; idx < TS.length; idx++) {
+        if (hitSet.has(idx) || hitSet.has(idx - 1)) continue;
+        const p = TS[idx - 1], q = TS[idx];
+        const cand = cellsOf(p[1], p[2], q[1], q[2]);
+        if (!cand) continue;
+        for (const [A, B] of cand) {
+          if (segSeg(p, q, A, B) <= rr) { hitSet.add(ptSeg(p[1], p[2], A, B) <= ptSeg(q[1], q[2], A, B) ? idx - 1 : idx); break; }
         }
-      });
+      }
+      const hit = [...hitSet].sort((a, b) => a - b);
       if (!hit.length) continue;
       if (!result.has(T)) result.set(T, []);
       const ranges = result.get(T);
+      if (whole) { ranges.push([0, TS.length - 1, E.i]); continue; }
       let a0 = hit[0], prev = hit[0];
       for (let k = 1; k <= hit.length; k++) {
         if (k < hit.length && hit[k] === prev + 1) { prev = hit[k]; continue; }
@@ -406,16 +481,16 @@ function applyErasure() {
   for (const st of changed) saveStroke(st);
   return changed.length;
 }
-function paintAll(ctx, strokes, W, H, K) {
+function paintAll(ctx, strokes, b, K, bg = '#ffffff') {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-  ctx.setTransform(K, 0, 0, K, 0, 0);
+  if (bg) { ctx.fillStyle = bg; ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height); }
+  else ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+  ctx.setTransform(K, 0, 0, K, -b.x0 * K, -b.y0 * K);
   for (const st of strokes) if (visibleInk(st)) drawStroke(ctx, st);
 }
 function repaint() {
-  const { x, K } = S.paper;
-  paintAll(x, S.strokes, S.paperSize[0], S.paperSize[1], K);
+  const { x, K, b } = S.paper;
+  paintAll(x, S.strokes, b, K);
   invalidateSharp();
   requestRender();
 }
@@ -467,6 +542,12 @@ let gesture = null, mousePan = null, spaceDown = false;
 function onDown(e) {
   if (!S.meta || document.querySelector('dialog[open]')) return;
   hideNibs();
+  if (e.pointerType === 'pen' && e.button === 2) { e.preventDefault(); penButton(); return; }
+  if (Replay.on && e.pointerType !== 'touch') {
+    mousePan = { x: e.clientX, y: e.clientY, v: { ...S.view } };
+    view.setPointerCapture(e.pointerId);
+    return;
+  }
   if (e.pointerType === 'touch') {
     if (!S.touchNav || S.active || performance.now() - S.lastPen < PALM_MS) return;
     touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -493,10 +574,13 @@ function onDown(e) {
     t0,
     tool: eraserEnd ? 'eraser' : S.tool,
     eraser_end: eraserEnd,
-    width_mm: eraserEnd || S.tool === 'eraser' ? S.eraserWidth : S.width,
+    width_mm: S.width,
     brush: eraserEnd || S.tool === 'eraser' ? null : S.brush,
-    smoothing: S.smoothing,
-    smoothing_tau_ms: tauFor(S.smoothing),
+    erase_mode: eraserEnd || S.tool === 'eraser' ? S.eraseMode : undefined,
+    smoothing: eraserEnd || S.tool === 'eraser' ? 0 : S.smoothing,
+    smoothing_tau_ms: eraserEnd || S.tool === 'eraser' ? 0 : tauFor(S.smoothing),
+    pressure_gamma: rnd(S.device.pressure_gamma || 1, 4),
+    prompt: S.prompt ? S.prompt.id : null,
     figure: S.figure,
     tags: S.fill ? ['fill'] : [],
     pointer_type: e.pointerType,
@@ -547,7 +631,10 @@ function onMove(e) {
     Diag.move(e, list.length);
     return;
   }
-  if (e.pointerType === 'pen' && e.buttons === 0 && S.meta) {
+  if (e.pointerType === 'pen' && !(e.buttons & 1) && S.meta && !Replay.on) {
+    const side = (e.buttons & 2) !== 0;
+    if (side && !S.sideDown) penButton();
+    S.sideDown = side;
     for (const ce of list) S.hover.push(sampleOf(ce, 0));
     trimHover();
     S.lastPen = performance.now();
@@ -576,7 +663,7 @@ function finish(e, cancelled) {
   }
   S.active = null;
   if (st.tool === 'eraser') { applyErasure(); repaint(); }
-  else inkLive(st, from);
+  else { inkLive(st, from); maybeExtend(); }
   S.lastPen = performance.now();
   saveStroke(st);
   markChanged();
@@ -622,7 +709,7 @@ function endTouch(e) {
 
 /* ------------------------------------------------------------ actions */
 function undo() {
-  if (S.active) return;
+  if (S.active || Replay.on) return;
   for (let i = S.strokes.length - 1; i >= 0; i--) {
     const st = S.strokes[i];
     if (!st.undone_at) {
@@ -636,33 +723,41 @@ function undo() {
   }
 }
 function redo() {
-  if (S.active || !S.redo.length) return;
+  if (S.active || Replay.on || !S.redo.length) return;
   const i = S.redo.pop(), st = S.strokes[i];
   st.undone_at = null;
   saveStroke(st); logEvent('redo', { stroke: i });
   if (st.tool === 'eraser') applyErasure();
   repaint(); markChanged(); updateTools();
 }
-function setNib(w) {
-  if (S.tool === 'eraser') { S.eraserWidth = w; localStorage.setItem('nh-eraser', String(w)); }
-  else { S.width = w; localStorage.setItem('nh-nib', String(w)); }
-  updateTools();
-}
+function setNib(w) { S.width = w; localStorage.setItem('nh-nib', String(w)); updateTools(); }
+function setEraseMode(m) { S.eraseMode = m === 'cut' ? 'cut' : 'stroke'; localStorage.setItem('nh-erase-mode', S.eraseMode); updateTools(); }
 function setBrush(b) { if (BRUSHES[b]) { S.brush = b; localStorage.setItem('nh-brush', b); if (S.tool === 'eraser') { S.tool = 'pen'; buildNibs(); } updateTools(); } }
 function setSmoothing(v) { S.smoothing = clamp(Math.round(v), 0, 100); localStorage.setItem('nh-smooth', String(S.smoothing)); updateTools(); }
 function toggleEraser() { S.tool = S.tool === 'eraser' ? 'pen' : 'eraser'; buildNibs(); updateTools(); }
-function toggleFigure() {
+function toggleFigure(source = 'button') {
   if (!S.meta) return;
   if (S.figure == null) {
     S.meta.figure_count = (S.meta.figure_count || 0) + 1;
     S.figure = S.meta.figure_count;
-    logEvent('figure_start', { figure: S.figure });
-    toast(`Figure ${S.figure}: strokes are being marked`);
+    logEvent('figure_start', { figure: S.figure, source });
+    toast(`Figure ${S.figure} started`);
   } else {
-    logEvent('figure_end', { figure: S.figure });
+    logEvent('figure_end', { figure: S.figure, source });
+    toast(`Figure ${S.figure} done`);
     S.figure = null;
   }
   markChanged(); updateTools();
+}
+// the pen's side button (S Pen) or lower barrel button (Wacom) starts and ends a figure
+let lastPenButton = 0;
+function penButton() {
+  if (!S.penButtonFigure || Replay.on) return;
+  const t = performance.now();
+  if (t - lastPenButton < 400) return;
+  lastPenButton = t;
+  toggleFigure('pen_button');
+  if (navigator.vibrate) navigator.vibrate(S.figure != null ? 25 : [15, 60, 15]);
 }
 function toggleFill() {
   S.fill = !S.fill;
@@ -682,9 +777,9 @@ function markChanged() {
 function persistViewSoon() { if (S.meta) { S.meta.view = { ...S.view }; scheduleMetaSave(); } }
 function scheduleMetaSave() { clearTimeout(metaTimer); metaTimer = setTimeout(flushMeta, 900); }
 function makeThumb() {
-  const [W, H] = S.paperSize, k = 120 / Math.max(W, H);
-  const c = document.createElement('canvas'); c.width = Math.round(W * k); c.height = Math.round(H * k);
-  c.getContext('2d').drawImage(S.paper.c, 0, 0, c.width, c.height);
+  const pc = S.paper.c, k = 120 / Math.max(pc.width, pc.height);
+  const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(pc.width * k)); c.height = Math.max(1, Math.round(pc.height * k));
+  c.getContext('2d').drawImage(pc, 0, 0, c.width, c.height);
   return c.toDataURL('image/jpeg', 0.7);
 }
 async function flushMeta() {
@@ -701,12 +796,17 @@ function newId() {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}_${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}_${uid().slice(0, 4)}`;
 }
 async function newDrawing(paperName, landscape, title) {
-  const [a, b] = PAPERS[paperName] || PAPERS.A4;
-  const [W, H] = landscape ? [b, a] : [a, b];
+  let paper;
+  if (paperName === 'Endless') paper = { name: 'Endless', endless: true, x0: -200, y0: -200, w_mm: 400, h_mm: 400 };
+  else {
+    const [a, b] = PAPERS[paperName] || PAPERS.A4;
+    const [W, H] = landscape ? [b, a] : [a, b];
+    paper = { name: paperName, w_mm: W, h_mm: H };
+  }
   const now = new Date().toISOString();
   const meta = {
     id: newId(), format: FORMAT, title: title || '', created: now, updated: now,
-    paper: { name: paperName, w_mm: W, h_mm: H },
+    paper,
     tags: [], notes: '', sessions: [], figure_count: 0, stroke_count: 0,
     rev: 0, synced_rev: 0, drive: {}, view: null,
   };
@@ -714,15 +814,17 @@ async function newDrawing(paperName, landscape, title) {
   await openDrawing(meta.id);
 }
 async function openDrawing(id) {
+  if (Replay.on) Replay.close();
+  if (S.prompt && (!S.meta || S.meta.id !== id)) endPrompt(false);
   if (S.meta) await flushMeta();
   const meta = await DB.get('drawings', id);
   if (!meta) { toast('That drawing is no longer on this device.'); return; }
   const strokes = (await DB.strokes(id)).sort((a, b) => a.i - b.i).map(normalizeStroke);
   Object.assign(S, {
     meta, strokes, redo: [], figure: null, fill: false, hover: [], hoverDropped: 0, active: null,
-    paperSize: [meta.paper.w_mm, meta.paper.h_mm], sessionId: `${Date.now().toString(36)}-${uid()}`, sessionLogged: false,
+    endless: !!meta.paper.endless, sessionId: `${Date.now().toString(36)}-${uid()}`, sessionLogged: false,
   });
-  S.paper = makePaper(meta.paper.w_mm, meta.paper.h_mm);
+  S.paper = makePaper(boundsOfMeta(meta, strokes));
   applyErasure();
   repaint();
   localStorage.setItem('nh-last', id);
@@ -753,7 +855,9 @@ async function buildExport(id) {
     exported_by: `natural-hand ${APP_VERSION}`,
     sample_fields: SAMPLE_FIELDS,
     units: {
-      coordinates: 'x_mm, y_mm in paper millimetres, origin at top-left of the sheet',
+      coordinates: 'x_mm, y_mm in paper millimetres, origin at top-left of the sheet (on endless pages coordinates can be negative)',
+      pressure_gamma: 'pressure feel of the device when drawn: width uses pressure ** pressure_gamma; recorded pressure is unchanged',
+      prompt: 'id of the session prompt the stroke was drawn under (see prompts), or null',
       t0: 'stroke start, epoch milliseconds (high resolution)',
       dt_ms: 'milliseconds since the stroke t0; negative in hover (pen in the air before the stroke)',
       last_sample: 'the final sample of a stroke is the pen-up event (pressure 0) unless the stroke was cancelled',
@@ -763,6 +867,7 @@ async function buildExport(id) {
       raw: 'present when smoothing_tau_ms > 0: the unsmoothed device samples, same columns; absent means samples are raw',
       brush: 'technical (constant width), ink (width from pressure, mild), brush (width from pressure, strong); width_mm is the nominal width',
       erased: '[[first_sample, last_sample, eraser_stroke_i], ...] parts of this stroke removed by later eraser strokes; the final drawing omits them',
+      erase_mode: 'on eraser strokes: "stroke" deletes every line it touches (the whole range is marked), "cut" removes only the parts it passes over; the eraser is as wide as the pen',
       ppmm: 'CSS pixels per physical millimetre on this device at zoom 1 (from calibration)',
     },
     strokes: strokes.map(({ drawing, ...s }) => s),
@@ -783,10 +888,8 @@ async function previewPng(id) {
   const cur = S.meta && S.meta.id === id;
   const meta = cur ? S.meta : await DB.get('drawings', id);
   const strokes = cur ? S.strokes : (await DB.strokes(id)).sort((a, b) => a.i - b.i).map(normalizeStroke);
-  const W = meta.paper.w_mm, H = meta.paper.h_mm, K = Math.min(6, 2400 / Math.max(W, H));
-  const c = document.createElement('canvas'); c.width = Math.round(W * K); c.height = Math.round(H * K);
-  paintAll(c.getContext('2d'), strokes, W, H, K);
-  return new Promise((res) => c.toBlob(res, 'image/png'));
+  const b = imageBounds(meta, strokes), K = Math.min(6, 2400 / Math.max(b.w, b.h));
+  return canvasBlob(renderImage(strokes, b, K, '#ffffff'), 'image/png');
 }
 async function gzip(str) {
   const stream = new Blob([str]).stream().pipeThrough(new CompressionStream('gzip'));
@@ -1049,6 +1152,302 @@ function autoSync() {
   else updateDriveChip();
 }
 
+
+/* ------------------------------------------------------------ images: PNG and SVG */
+function imageBounds(meta, strokes) {
+  const p = meta.paper;
+  if (p.endless) return contentBox(strokes, 10) || { x0: 0, y0: 0, w: 100, h: 100 };
+  return { x0: 0, y0: 0, w: p.w_mm, h: p.h_mm };
+}
+function renderImage(strokes, b, K, bg) {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(b.w * K)); c.height = Math.max(1, Math.round(b.h * K));
+  paintAll(c.getContext('2d'), strokes, b, K, bg);
+  return c;
+}
+function canvasBlob(c, type) {
+  return new Promise((res, rej) => c.toBlob((bl) => (bl ? res(bl) : rej(new Error('The image is too large for this device. Choose a lower resolution.'))), type));
+}
+const MAX_EXPORT_PX = 16e6;
+function exportPlan(meta, strokes) {
+  const b = imageBounds(meta, strokes);
+  const dpi = Number($('#x-res').value);
+  let K = dpi / 25.4, reduced = false;
+  if (b.w * K * b.h * K > MAX_EXPORT_PX) { K = Math.sqrt(MAX_EXPORT_PX / (b.w * b.h)); reduced = true; }
+  return { b, K, dpi: Math.floor(K * 25.4), reduced };
+}
+function svgOf(meta, strokes, transparent) {
+  const b = imageBounds(meta, strokes), f = (v) => Math.round(v * 1000) / 1000;
+  const esc = (t) => String(t).replace(/[<&>"]/g, (c) => ({ '<': '&lt;', '&': '&amp;', '>': '&gt;', '"': '&quot;' }[c]));
+  const out = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${f(b.w)}mm" height="${f(b.h)}mm" viewBox="${f(b.x0)} ${f(b.y0)} ${f(b.w)} ${f(b.h)}">`,
+    `<title>${esc(meta.title || meta.id)}</title>`,
+  ];
+  if (!transparent) out.push(`<rect x="${f(b.x0)}" y="${f(b.y0)}" width="${f(b.w)}" height="${f(b.h)}" fill="#ffffff"/>`);
+  out.push('<g fill="none" stroke="#000000" stroke-linecap="round" stroke-linejoin="round">');
+  for (const st of strokes) {
+    if (st.undone_at || st.tool === 'eraser') continue;
+    const { dot, runs } = strokeRuns(st);
+    if (dot) out.push(`<circle cx="${f(dot[0])}" cy="${f(dot[1])}" r="${f(dot[2])}" fill="#000000" stroke="none"/>`);
+    for (const r of runs) out.push(`<path stroke-width="${f(r.w)}" d="M${r.pts.map((q) => `${f(q[0])} ${f(q[1])}`).join('L')}"/>`);
+  }
+  out.push('</g>', '</svg>');
+  return out.join('\n');
+}
+function fileBase() { return (S.meta.title || S.meta.id).replace(/[^\p{L}\p{N}_\- ]+/gu, '').trim().replace(/\s+/g, '-') || S.meta.id; }
+async function makeExportFile() {
+  const fmt = $('#x-format').value, transparent = $('#x-transparent').checked;
+  if (fmt === 'svg') {
+    const text = svgOf(S.meta, S.strokes, transparent);
+    return new File([text], `${fileBase()}.svg`, { type: 'image/svg+xml' });
+  }
+  const { b, K } = exportPlan(S.meta, S.strokes);
+  const blob = await canvasBlob(renderImage(S.strokes, b, K, transparent ? null : '#ffffff'), 'image/png');
+  return new File([blob], `${fileBase()}.png`, { type: 'image/png' });
+}
+function updateExportInfo() {
+  const png = $('#x-format').value === 'png';
+  $('#x-res-row').hidden = !png;
+  if (!S.meta) return;
+  const { b, K, dpi, reduced } = exportPlan(S.meta, S.strokes);
+  $('#x-info').textContent = png
+    ? `${Math.round(b.w * K)} × ${Math.round(b.h * K)} pixels, ${Math.round(b.w)} × ${Math.round(b.h)} mm${reduced ? `. Reduced to ${dpi} dpi, the most this device can make.` : '.'}`
+    : `Vector lines in real millimetres, ${Math.round(b.w)} × ${Math.round(b.h)} mm. Opens in Illustrator, Inkscape and browsers.`;
+  let canShare = false;
+  try { canShare = !!(navigator.canShare && navigator.canShare({ files: [new File(['x'], 'x.png', { type: 'image/png' })] })); } catch {}
+  $('#x-share').hidden = !canShare;
+}
+function openExport() { $('#export-dlg').showModal(); updateExportInfo(); }
+async function doExport(share) {
+  const btn = share ? $('#x-share') : $('#x-save'), label = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Preparing…';
+  try {
+    const file = await makeExportFile();
+    if (share) await navigator.share({ files: [file], title: S.meta.title || 'Drawing' });
+    else download(file.name, file);
+    $('#export-dlg').close();
+  } catch (err) { if (err.name !== 'AbortError') toast(err.message); }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+
+/* ------------------------------------------------------------ replay
+ * Redraws the drawing in the order and at the speed it was made. Erased ink appears
+ * and is then painted over when the eraser passes; undo and redo happen when they did.
+ * "Skip pauses" shortens gaps longer than 1.5 s (thinking, breaks, other days). */
+const Replay = {
+  on: false, paper: null, items: [], toggles: [], events: [], strokes: [], total: 0, t: 0, playing: false, speed: 1, skip: true,
+  k: 0, partial: 0, ti: 0, hidden: new Set(), lastFrame: 0, raf: 0, sessions: new Map(),
+  async open() {
+    if (!S.meta || S.active || this.on) return;
+    const strokes = S.strokes.filter((st) => st.samples.length).slice().sort((a, b) => a.t0 - b.t0);
+    if (!strokes.length) { toast('Nothing to replay yet.'); return; }
+    hideNibs(); if ($('#menu').open) $('#menu').close();
+    this.events = (await DB.events(S.meta.id)).filter((e) => e.type === 'undo' || e.type === 'redo').sort((a, b) => a.t - b.t);
+    this.strokes = strokes;
+    this.sessions = new Map((S.meta.sessions || []).map((ss) => [ss.id, ss]));
+    this.skip = $('#rp-skip').checked; this.speed = Number($('#rp-speed').value);
+    this.build();
+    this.paper = makePaper(S.paper.b);
+    this.on = true;
+    document.body.classList.add('replaying');
+    $('#replay-bar').hidden = false;
+    this.seek(0);
+    this.play();
+  },
+  build() {
+    const MAXG = 1500, COMP = 400;
+    this.items = []; let cursor = 0, prevEnd = null;
+    const byI = new Map();
+    for (const st of this.strokes) {
+      const dur = Math.max(0, st.samples[st.samples.length - 1][0]);
+      let gap = prevEnd == null ? 0 : Math.max(0, st.t0 - prevEnd);
+      if (this.skip && gap > MAXG) gap = COMP;
+      const it = { st, rs: cursor + gap, dur, real: st.t0 };
+      cursor = it.rs + dur; prevEnd = st.t0 + dur;
+      this.items.push(it); byI.set(st.i, it);
+    }
+    this.total = cursor;
+    this.toggles = this.events.map((e) => ({ at: this.realToReplay(e.t), i: e.stroke, type: e.type })).filter((x) => byI.has(x.i));
+    // when an eraser lifts, the page is redrawn with what it erased removed
+    for (const it of this.items) if (it.st.tool === 'eraser') this.toggles.push({ at: it.rs + it.dur, i: it.st.i, type: 'erase' });
+    this.toggles.sort((a, b) => a.at - b.at);
+  },
+  realToReplay(t) {
+    const it = this.items; let lo = 0, hi = it.length - 1, k = -1;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (it[m].real <= t) { k = m; lo = m + 1; } else hi = m - 1; }
+    if (k < 0) return 0;
+    const a = it[k], off = t - a.real;
+    if (off <= a.dur) return a.rs + off;
+    const room = k + 1 < it.length ? it[k + 1].rs - (a.rs + a.dur) : 0;
+    return a.rs + a.dur + Math.min(off - a.dur, room);
+  },
+  countUpTo(st, tt) {
+    const P = st.samples; let lo = 0, hi = P.length - 1, k = 0;
+    while (lo <= hi) { const m = (lo + hi) >> 1; if (P[m][0] <= tt) { k = m + 1; lo = m + 1; } else hi = m - 1; }
+    return Math.max(1, k);
+  },
+  clear() { const { x, K, b } = this.paper; paintAll(x, [], b, K); },
+  seek(tau) {
+    this.t = clamp(tau, 0, this.total);
+    this.clear(); this.k = 0; this.partial = 0; this.ti = 0; this.hidden = new Set();
+    while (this.ti < this.toggles.length && this.toggles[this.ti].at <= this.t) this.applyToggle(this.toggles[this.ti++]);
+    this.draw(this.t);
+    this.ui(); requestRender();
+  },
+  applyToggle(g) { if (g.type === 'undo') this.hidden.add(g.i); else if (g.type === 'redo') this.hidden.delete(g.i); },
+  draw(tau) {
+    const ctx = this.paper.x;
+    const done = new Set();
+    for (const it of this.items) if (it.st.tool === 'eraser' && it.rs + it.dur <= tau && !this.hidden.has(it.st.i)) done.add(it.st.i);
+    while (this.k < this.items.length && this.items[this.k].rs <= tau) {
+      const it = this.items[this.k], st = it.st, n = st.samples.length;
+      const m = Math.min(n, this.countUpTo(st, tau - it.rs));
+      if (!this.hidden.has(st.i) && m > this.partial) {
+        if (st.tool === 'eraser') {
+          // while erasing: a cutting eraser paints white, a whole-line eraser leaves no mark
+          if (!done.has(st.i) && eraseModeOf(st) === 'cut') drawStroke(ctx, st, this.partial, m, false);
+        } else {
+          const cut = (st.erased || []).filter((r) => done.has(r[2]));
+          if (cut.length) drawStroke(ctx, Object.assign(Object.create(st), { erased: cut }), this.partial, m, true);
+          else drawStroke(ctx, st, this.partial, m, false);
+        }
+      }
+      this.partial = m;
+      if (m >= n) { this.k++; this.partial = 0; } else break;
+    }
+  },
+  advance(tau) {
+    if (this.ti < this.toggles.length && this.toggles[this.ti].at <= tau) { this.seek(tau); return; }
+    this.draw(tau);
+  },
+  tick(now) {
+    if (!this.playing) return;
+    const dt = this.lastFrame ? Math.min(100, now - this.lastFrame) : 0;
+    this.lastFrame = now;
+    this.t = Math.min(this.total, this.t + dt * this.speed);
+    this.advance(this.t);
+    this.ui(); requestRender();
+    if (this.t >= this.total) { this.pause(); return; }
+    this.raf = requestAnimationFrame((n) => this.tick(n));
+  },
+  play() {
+    if (this.t >= this.total) this.seek(0);
+    this.playing = true; this.lastFrame = 0; $('#rp-play').textContent = 'Pause';
+    cancelAnimationFrame(this.raf); this.raf = requestAnimationFrame((n) => this.tick(n));
+  },
+  pause() { this.playing = false; cancelAnimationFrame(this.raf); $('#rp-play').textContent = this.t >= this.total ? 'Play again' : 'Play'; },
+  close() {
+    this.pause(); this.on = false; this.paper = null;
+    document.body.classList.remove('replaying');
+    $('#replay-bar').hidden = true;
+    invalidateSharp(); requestRender();
+  },
+  current() {
+    const it = this.items[this.k];
+    if (!it) return null;
+    if (it.rs <= this.t) { const P = it.st.samples[Math.max(0, this.partial - 1)]; return { x: P[1], y: P[2], down: true, st: it.st }; }
+    let best = null;
+    for (const h of it.st.hover || []) { if (it.rs + h[0] <= this.t) best = h; else break; }
+    if (best) return { x: best[1], y: best[2], down: false, st: it.st };
+    return { st: it.st };
+  },
+  drawCursor(ctx, k) {
+    const c = this.current();
+    if (!c || c.x == null) return;
+    const r = 5 / k;
+    ctx.beginPath(); ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+    ctx.lineWidth = 1.5 / k; ctx.strokeStyle = '#3f8fa8';
+    if (c.down) { ctx.fillStyle = 'rgba(164,221,237,0.55)'; ctx.fill(); }
+    ctx.stroke();
+  },
+  ui() {
+    const fmt = (ms) => { const t = Math.floor(ms / 1000); return t >= 3600 ? `${Math.floor(t / 3600)}:${pad2(Math.floor(t / 60) % 60)}:${pad2(t % 60)}` : `${Math.floor(t / 60)}:${pad2(t % 60)}`; };
+    $('#rp-seek').value = this.total ? Math.round((this.t / this.total) * 1000) : 0;
+    $('#rp-time').textContent = `${fmt(this.t)} / ${fmt(this.total)}`;
+    const c = this.current(), ss = c && this.sessions.get(c.st.session);
+    const info = [];
+    if (ss) info.push(`${ss.device ? ss.device.name : ''}, ${new Date(ss.started).toLocaleDateString()}`);
+    if (c && c.st.figure != null) info.push(`figure ${c.st.figure}`);
+    if (c && c.st.tool === 'eraser') info.push('erasing');
+    $('#rp-info').textContent = info.join(', ');
+  },
+};
+
+/* ------------------------------------------------------------ life size */
+function lifeSize() {
+  if (!S.meta) return;
+  if (Math.abs(S.view.s - 1) < 0.005) { fit(); return; }
+  const D = screenToDoc(cw / 2, ch / 2);
+  setViewAround(D, cw / 2, ch / 2, 1, S.view.r);
+  persistViewSoon(); requestRender();
+  if (!S.device.calibrated) toast('Calibrate this device in the menu so life size is exact.');
+}
+let zoomShown = null;
+function updateZoomChip() {
+  const life = Math.abs(S.view.s - 1) < 0.005;
+  const t = !S.meta ? '' : life ? 'Life size' : `${Math.round(S.view.s * 100)}%`;
+  if (t !== zoomShown) {
+    zoomShown = t;
+    const c = $('#zoom-chip');
+    c.textContent = t; c.hidden = !t;
+    c.title = life ? 'Fit the page (0)' : 'Show at life size (L)';
+  }
+}
+
+/* ------------------------------------------------------------ session prompts */
+let promptTimer = 0;
+async function startPrompt() {
+  const kind = $('#pr-kind').value;
+  const text = kind === 'custom' ? ($('#pr-custom').value.trim() || 'Own prompt') : kind;
+  const minutes = Number($('#pr-min').value);
+  $('#prompt-dlg').close(); if ($('#menu').open) $('#menu').close();
+  if (S.prompt) endPrompt(false);
+  if ($('#pr-new').checked) {
+    const p = S.meta ? S.meta.paper : null;
+    await newDrawing(p ? (p.endless ? 'Endless' : p.name) : defaultPaper(), !!(p && !p.endless && p.w_mm > p.h_mm), text);
+  }
+  const now = Date.now();
+  S.prompt = { id: `p-${now.toString(36)}`, text, minutes, started: now, ends: minutes ? now + minutes * 60000 : null };
+  S.meta.prompts = S.meta.prompts || [];
+  S.meta.prompts.push({ id: S.prompt.id, text, minutes, started: new Date(now).toISOString(), ended: null });
+  logEvent('prompt_start', { prompt: S.prompt.id, text, minutes });
+  markChanged();
+  clearInterval(promptTimer); promptTimer = setInterval(promptTick, 1000);
+  promptTick();
+  toast(minutes ? `${text}, ${minutes} minutes. The timer is running.` : `${text}. Tap the timer to end the session.`);
+}
+function promptTick() {
+  const p = S.prompt, c = $('#prompt-chip');
+  if (!p) { c.hidden = true; return; }
+  const now = Date.now();
+  if (p.ends && now >= p.ends) { endPrompt(true); return; }
+  const ms = p.ends ? p.ends - now : now - p.started, t = Math.floor(ms / 1000);
+  c.hidden = false;
+  c.textContent = `${p.text}, ${Math.floor(t / 60)}:${pad2(t % 60)}${p.ends ? ' left' : ''}`;
+}
+function endPrompt(timeUp) {
+  const p = S.prompt;
+  if (!p) return;
+  S.prompt = null; clearInterval(promptTimer); $('#prompt-chip').hidden = true;
+  const rec = S.meta && (S.meta.prompts || []).find((x) => x.id === p.id);
+  if (rec) { rec.ended = new Date().toISOString(); markChanged(); }
+  logEvent('prompt_end', { prompt: p.id, reason: timeUp ? 'time' : 'ended' });
+  if (timeUp) {
+    toast(`Time is up for "${p.text}". Keep drawing if you like; new strokes are outside the session.`);
+    if (navigator.vibrate) navigator.vibrate([40, 80, 40]);
+  }
+}
+
+/* ------------------------------------------------------------ pressure feel */
+const gammaFromFeel = (v) => rnd(Math.pow(2, (1.5 * v) / 100), 4);
+const feelFromGamma = (g) => Math.round((Math.log2(g || 1) / 1.5) * 100);
+function drawFeelCurve() {
+  const g = gammaFromFeel(Number($('#m-feel').value)), pts = [];
+  for (let i = 0; i <= 24; i++) { const p = i / 24; pts.push(`${(p * 100).toFixed(1)},${(60 - Math.pow(p, g) * 60).toFixed(1)}`); }
+  $('#feel-curve').setAttribute('points', pts.join(' '));
+}
+
 /* ------------------------------------------------------------ diagnostics */
 const Diag = {
   el: $('#diag'), last: null, seen: {}, hoverN: 0, hoverT0: 0, hoverHz: 0, coal: [], stroke: null, timer: 0,
@@ -1131,10 +1530,12 @@ function buildRail() {
   buildNibs();
 }
 function buildNibs() {
-  const list = S.tool === 'eraser' ? ERASERS : NIBS;
-  $('#nib-list').innerHTML = list.map((w, i) =>
+  const er = S.tool === 'eraser';
+  $('#nib-list').innerHTML = NIBS.map((w, i) =>
     `<button role="menuitemradio" data-w="${w}" title="${w} mm (${i + 1})"><i class="stroke" style="height:${Math.min(16, nibThick(w))}px"></i><small>${w}</small></button>`).join('');
-  $('#nib-title').textContent = S.tool === 'eraser' ? 'Eraser width, mm' : 'Width, mm';
+  $('#nib-title').textContent = 'Width, mm';
+  for (const id of ['#brush-seg', '#nib-title', '#nib-list', '.pop .smooth']) $(id).hidden = er;
+  $('#erase-box').hidden = !er;
 }
 const BRUSH_ICON = {
   technical: '<line x1="5" y1="10" x2="19" y2="10" stroke="currentColor" stroke-linecap="round" stroke-width="W"/>',
@@ -1142,13 +1543,17 @@ const BRUSH_ICON = {
   brush: '<path d="M3 13 C7 6 13 6 21 9 C14 9.5 9 11 3 13Z" fill="currentColor"/>',
 };
 function updateTools() {
-  const nb = $('#nib-btn'), er = S.tool === 'eraser', w = er ? S.eraserWidth : S.width;
+  const nb = $('#nib-btn'), er = S.tool === 'eraser', w = S.width;
   const sw = Math.min(7, nibThick(w) / 1.6 + 0.6);
   const glyph = er ? `<line x1="5" y1="10" x2="19" y2="10" stroke="currentColor" stroke-linecap="round" stroke-dasharray="2 3" stroke-width="${sw}"/>`
     : BRUSH_ICON[S.brush].replace('W', S.brush === 'technical' ? sw : Math.max(0.5, sw / 3));
   nb.innerHTML = `<svg viewBox="0 0 24 24">${glyph}</svg><span>${w}</span>`;
   for (const b of document.querySelectorAll('#brush-seg button')) b.setAttribute('aria-pressed', String(!er && b.dataset.b === S.brush));
-  nb.setAttribute('aria-label', `${er ? 'Eraser' : 'Pen'} width ${w} mm, smoothing ${S.smoothing}`);
+  nb.setAttribute('aria-label', er ? `Eraser, ${S.eraseMode === 'cut' ? 'cuts through lines' : 'deletes whole lines'}` : `Pen width ${w} mm, smoothing ${S.smoothing}`);
+  for (const b of document.querySelectorAll('#erase-seg button')) b.setAttribute('aria-pressed', String(b.dataset.m === S.eraseMode));
+  $('#erase-note').textContent = S.eraseMode === 'cut'
+    ? `Cuts through lines where it passes, as wide as the pen (${w} mm).`
+    : 'Deletes every line it touches, as it was drawn.';
   for (const b of document.querySelectorAll('#nib-list button')) b.setAttribute('aria-pressed', String(Number(b.dataset.w) === w));
   $('#smooth-range').value = S.smoothing;
   $('#smooth-val').textContent = S.smoothing;
@@ -1201,6 +1606,9 @@ function openMenu() {
     ? `Calibrated: ${S.device.ppmm.toFixed(3)} screen px per mm.`
     : 'Not calibrated yet. Stroke sizes in mm will be wrong until you calibrate.';
   $('#m-touch').checked = S.touchNav;
+  $('#m-penbtn').checked = S.penButtonFigure;
+  $('#m-feel').value = feelFromGamma(S.device.pressure_gamma || 1);
+  drawFeelCurve();
   $('#m-diag').checked = S.diag;
   $('#menu-title').textContent = m ? (m.title || m.id) : 'Drawing';
   $('#m-foot').textContent = `Natural Hand ${APP_VERSION}. ${m ? `${m.stroke_count || 0} strokes, ${m.figure_count || 0} figures in this drawing.` : ''}`;
@@ -1330,6 +1738,7 @@ function bindUI() {
   $('#nib-list').onclick = (e) => { const b = e.target.closest('button'); if (b) { setNib(Number(b.dataset.w)); hideNibs(); } };
   $('#smooth-range').oninput = (e) => setSmoothing(Number(e.target.value));
   $('#brush-seg').onclick = (e) => { const b = e.target.closest('button'); if (b) setBrush(b.dataset.b); };
+  $('#erase-seg').onclick = (e) => { const b = e.target.closest('button'); if (b) { setEraseMode(b.dataset.m); hideNibs(); } };
   $('#eraser-btn').onclick = toggleEraser;
   $('#undo-btn').onclick = undo;
   $('#redo-btn').onclick = redo;
@@ -1344,6 +1753,29 @@ function bindUI() {
   for (const id of ['#m-dev-name', '#m-dev-pressure']) $(id).addEventListener('change', deviceEdit);
   $('#m-touch').onchange = (e) => { S.touchNav = e.target.checked; localStorage.setItem('nh-touch', S.touchNav ? '1' : '0'); };
   $('#m-diag').onchange = (e) => setDiag(e.target.checked);
+  $('#m-penbtn').onchange = (e) => { S.penButtonFigure = e.target.checked; localStorage.setItem('nh-penbtn', S.penButtonFigure ? '1' : '0'); };
+  $('#m-feel').oninput = () => drawFeelCurve();
+  $('#m-feel').onchange = (e) => { S.device.pressure_gamma = gammaFromFeel(Number(e.target.value)); saveDevice(S.device); toast('Pressure feel saved for this device. It applies to new strokes.'); };
+  $('#m-replay').onclick = () => Replay.open();
+  $('#m-image').onclick = () => { $('#menu').close(); openExport(); };
+  $('#m-prompt').onclick = () => { $('#prompt-dlg').showModal(); };
+  $('#x-format').onchange = updateExportInfo;
+  $('#x-res').onchange = updateExportInfo;
+  $('#x-save').onclick = () => doExport(false);
+  $('#x-share').onclick = () => doExport(true);
+  $('#x-cancel').onclick = () => $('#export-dlg').close();
+  $('#pr-kind').onchange = (e) => { $('#pr-custom-row').hidden = e.target.value !== 'custom'; };
+  $('#pr-start').onclick = () => startPrompt();
+  $('#pr-cancel').onclick = () => $('#prompt-dlg').close();
+  $('#prompt-chip').onclick = () => { if (S.prompt && confirm(`End the session "${S.prompt.text}" now?`)) endPrompt(false); };
+  $('#zoom-chip').onclick = lifeSize;
+  $('#rp-play').onclick = () => (Replay.playing ? Replay.pause() : Replay.play());
+  $('#rp-close').onclick = () => Replay.close();
+  $('#rp-seek').oninput = (e) => { Replay.pause(); Replay.seek((Number(e.target.value) / 1000) * Replay.total); };
+  $('#rp-speed').onchange = (e) => { Replay.speed = Number(e.target.value); };
+  $('#rp-skip').onchange = (e) => { const frac = Replay.total ? Replay.t / Replay.total : 0; Replay.skip = e.target.checked; Replay.build(); Replay.seek(frac * Replay.total); };
+  $('#n-paper').onchange = (e) => { $('#n-orient-row').hidden = ['Endless', 'Square'].includes(e.target.value); };
+
   $('#m-close').onclick = () => $('#menu').close();
   $('#m-new').onclick = () => { $('#n-paper').value = defaultPaper(); $('#n-title').value = ''; $('#new-dlg').showModal(); };
   $('#m-list').onclick = openList;
@@ -1377,11 +1809,17 @@ function bindUI() {
   addEventListener('keydown', (e) => {
     if (document.querySelector('dialog[open]') || (e.target.closest && e.target.closest('input,textarea,select'))) return;
     const k = e.key.toLowerCase(), mod = e.ctrlKey || e.metaKey;
+    if (Replay.on) {
+      if (k === ' ') { e.preventDefault(); Replay.playing ? Replay.pause() : Replay.play(); }
+      else if (k === 'escape') Replay.close();
+      else if (k === '0') fit();
+      return;
+    }
     if (mod && k === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); }
     else if (mod && k === 'y') { e.preventDefault(); redo(); }
     else if (mod) return;
     else if (k === ' ') { spaceDown = true; view.style.cursor = 'grab'; e.preventDefault(); }
-    else if (k >= '1' && k <= '7') { const list = S.tool === 'eraser' ? ERASERS : NIBS; const w = list[Number(k) - 1]; if (w != null) setNib(w); }
+    else if (k >= '1' && k <= '7') setNib(NIBS[Number(k) - 1]);
     else if (k === 'b') { const ks = Object.keys(BRUSHES); setBrush(ks[(ks.indexOf(S.brush) + 1) % ks.length]); }
     else if (k === '[') setSmoothing(S.smoothing - 10);
     else if (k === ']') setSmoothing(S.smoothing + 10);
@@ -1389,6 +1827,8 @@ function bindUI() {
     else if (k === 'f') toggleFigure();
     else if (k === 'g') toggleFill();
     else if (k === '0') fit();
+    else if (k === 'l') lifeSize();
+    else if (k === 'r') Replay.open();
     else if (k === 'd') setDiag(!S.diag);
   });
   addEventListener('keyup', (e) => { if (e.key === ' ') { spaceDown = false; view.style.cursor = ''; } });
@@ -1410,7 +1850,7 @@ async function init() {
   resize();
   buildRail();
   S.width = NIBS.includes(Number(localStorage.getItem('nh-nib'))) ? Number(localStorage.getItem('nh-nib')) : 0.3;
-  S.eraserWidth = ERASERS.includes(Number(localStorage.getItem('nh-eraser'))) ? Number(localStorage.getItem('nh-eraser')) : 2;
+  S.eraseMode = localStorage.getItem('nh-erase-mode') === 'cut' ? 'cut' : 'stroke';
   S.smoothing = clamp(Number(localStorage.getItem('nh-smooth')) || 0, 0, 100);
   S.brush = BRUSHES[localStorage.getItem('nh-brush')] ? localStorage.getItem('nh-brush') : 'technical';
   bindUI();
@@ -1432,7 +1872,7 @@ async function init() {
 }
 
 // test hook (used by automated checks; harmless in normal use)
-window.__nh = { S, buildExport, undo, redo, toggleFigure, fit, Drive, syncAll, mergeData };
+window.__nh = { S, buildExport, undo, redo, toggleFigure, fit, Drive, syncAll, mergeData, Replay };
 
 init();
 })();

@@ -52,12 +52,14 @@ Then open the menu, turn on **Show live pen data**, and draw a few lines. The pa
 | Pen type: technical, ink pen, brush pen | width button, top row | B |
 | Pen width (0.1 to 2.0 mm) | width button | 1 to 7 |
 | Smoothing (0 to 100) | slider under the widths | [ and ] |
-| Eraser (0.5 to 8 mm, own width) | eraser button, or the Wacom eraser end | E |
+| Eraser: whole lines or cut through | eraser button, or the Wacom eraser end | E |
 | Undo / redo | arrows | Ctrl+Z / Ctrl+Shift+Z |
-| Mark a figure | figure button, press again when the figure is done | F |
+| Mark a figure | figure button, or the pen's side button; press again when the figure is done | F |
 | Mark black fill | fill button | G |
 | Move, zoom, rotate page | one or two fingers | Space+drag, wheel, Shift+wheel |
 | Fit page | fit button | 0 |
+| Life size (1:1) | zoom chip at the top | L |
+| Replay | menu, Replay | R, then Space to pause, Esc to close |
 | Live pen data | menu | D |
 
 Finger touches are ignored for a moment after the pen was near the screen, so a resting palm does not move the page. You can switch finger navigation off in the menu.
@@ -66,9 +68,23 @@ Finger touches are ignored for a moment after the pen was near the screen, so a 
 
 Undo never deletes data: undone strokes stay in the file, marked with the time they were undone.
 
+**Pen side button.** On the S Pen, press the side button while the pen hovers to start a figure, and again to finish it. The phone gives a short buzz. On the Wacom, the lower barrel button does the same when it is set to right-click (the default). You can turn this off in the menu.
+
+**Life size.** The zoom chip at the top shows the zoom. Tap it to see the page at real size (100% means 1 mm on screen is 1 mm on paper, if the device is calibrated); tap again to fit the page. Drawing mostly at life size keeps your hand movements comparable between drawings.
+
+**Pages.** A5 to A1, a 30 cm square, or an endless page that grows in any direction as you draw near its edge.
+
+**Replay.** Menu, Replay. The drawing redraws itself in the order and at the speed you made it, with a cursor where the pen was, including where it hovered. Erasing and undo happen when they happened. Skip pauses shortens breaks longer than 1.5 seconds; turn it off to see real time. You can zoom and move the page while it plays.
+
+**Export image.** Menu, Export image: PNG at 150, 300 or 600 dpi, or SVG with real millimetre sizes for Illustrator or Inkscape, with a white or transparent background. On Android you can share it directly. Endless pages are cropped to the ink.
+
+**Sessions.** Menu, Start a session: pick a prompt (figures only, fast gestures, your own) and a time. Every stroke drawn during it carries the session, and a timer shows at the top. When time is up the phone buzzes and the session ends; you can keep drawing.
+
+**Pressure feel.** Menu, This device: set how hard you press for the ink pen and brush pen to reach full width, separately for each device, so the S Pen and the Wacom feel alike. It changes only the drawn width; recorded pressure stays raw, and each stroke stores the setting.
+
 **Pen types.** Technical pen keeps one width. Ink pen and brush pen change width with pressure: ink pen gently, brush pen strongly, with thin starts and ends. The pressure itself is recorded the same way for all three.
 
-**Eraser.** It cuts the ink it passes over, in the data as well as on screen. Erased parts are marked on the stroke they belong to (`erased`) and left out of the final drawing. The ink is kept underneath, so undoing the eraser brings it back, and the eraser strokes themselves stay in the file as part of how you work.
+**Eraser.** It is always as wide as the pen and has one choice, in the width button while the eraser is on: **Whole lines** deletes every line it touches, exactly as the line was recorded; **Cut through** removes only the parts it passes over. Either way the ink is marked as erased in the data (`erased`) and left out of the final drawing, undoing the eraser brings it back, and the eraser strokes stay in the file as part of how you work.
 
 **Smoothing.** It changes the recorded line, not just the screen: `samples` holds the smoothed path you see. When smoothing is above 0, the unsmoothed device samples are kept next to it as `raw`, so nothing about your real movement is lost. Smoothing is time-based, so a level feels the same on the Wacom, the tablet and the phone.
 
@@ -88,10 +104,11 @@ One file per drawing: `<id>.json.gz` in Drive (plain `<id>.json` from Download J
       "hover": [ [dt_ms (negative), x_mm, y_mm, ...], ... ],
       "samples": [ [dt_ms, x_mm, y_mm, pressure, ...], ... ],   (the drawn, smoothed path)
       "raw": [ ... ],                                          (device samples, when smoothing > 0)
-      "brush", "smoothing", "smoothing_tau_ms", "erased": [[first, last, eraser_i], ...],
+      "brush", "smoothing", "smoothing_tau_ms", "pressure_gamma", "prompt", "erased": [[first, last, eraser_i], ...],
       "undone_at", "cancelled"
   } ],
-  "events": [ { "t", "type": "undo" | "redo" | "figure_start" | "figure_end" | "fill_start" | "fill_end", ... } ]
+  "prompts": [ { "id", "text", "minutes", "started", "ended" } ],
+  "events": [ { "t", "type": "undo" | "redo" | "figure_start" | "figure_end" | "fill_start" | "fill_end" | "prompt_start" | "prompt_end", ... } ]
 }
 ```
 

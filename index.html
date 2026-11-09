@@ -50,6 +50,9 @@
   .pop .seg{display:flex;gap:2px;min-width:240px;background:var(--line);border-radius:9px;padding:2px}
   .pop .seg button{flex:1;min-height:34px;padding:4px 8px;font:inherit;font-size:12px;border-radius:7px;white-space:nowrap;flex-direction:row}
   .pop .seg button[aria-pressed="true"]{background:var(--rail);color:var(--ink);box-shadow:0 0 0 1px var(--line)}
+  #erase-box{display:grid;gap:6px}
+  #erase-box[hidden],.pop [hidden]{display:none !important}
+  .erase-note{margin:0;font-size:12px;color:var(--muted);max-width:240px;padding:0 4px}
   .pop-title{font-size:12px;color:var(--muted);padding:0 4px}
   .pop .smooth{display:grid;gap:2px;padding:4px 4px 2px;font-size:12px;color:var(--muted);min-width:180px}
   .pop .smooth b{color:var(--ink);font-variant-numeric:tabular-nums;font-weight:600}
@@ -111,6 +114,25 @@
   .ruler .bar::before,.ruler .bar::after{content:"";position:absolute;top:-22px;width:2px;height:48px;background:var(--ink)}
   .ruler .bar::before{left:0}.ruler .bar::after{right:0}
   .foot{font-size:.8rem;color:var(--muted)}
+  .chip.prompt{background:var(--npb);color:var(--npb-ink);box-shadow:none;opacity:1;font-variant-numeric:tabular-nums}
+  .chip[hidden]{display:none}
+  body.replaying .rail, body.replaying .chips, body.replaying #nib-pop{display:none}
+  #replay-bar{position:fixed;z-index:5;left:0;right:0;bottom:0;background:var(--rail);box-shadow:0 0 0 1px var(--line);
+    display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding:10px 14px max(10px,env(safe-area-inset-bottom))}
+  #replay-bar[hidden]{display:none}
+  #replay-bar input[type=range]{flex:1 1 220px;accent-color:var(--ink)}
+  #replay-bar select{padding:6px 8px}
+  #rp-time{font-variant-numeric:tabular-nums;font-size:.9rem;min-width:7.5em}
+  #rp-info{font-size:.82rem;color:var(--muted);flex:1 1 100%;order:9}
+  #rp-play{min-width:6.5em}
+  .feel{display:grid;gap:4px}
+  .feel label{font-size:.9rem}
+  .feel svg{width:100%;height:60px;border:1px solid var(--line);border-radius:8px;background:transparent}
+  .feel svg .diag{stroke:var(--line);stroke-width:1;vector-effect:non-scaling-stroke}
+  .feel svg polyline{fill:none;stroke:var(--ink);stroke-width:2;vector-effect:non-scaling-stroke}
+  .feel input{width:100%;accent-color:var(--ink)}
+  .feel-ends{display:flex;justify-content:space-between;font-size:.8rem;color:var(--muted)}
+  label[hidden]{display:none}
   @media (prefers-reduced-motion:no-preference){ .rail button,.chip{transition:background-color .12s} }
 </style>
 </head>
@@ -134,6 +156,13 @@
   </div>
   <div class="pop-title" id="nib-title">Width, mm</div>
   <div class="nibs" id="nib-list" role="menu"></div>
+  <div id="erase-box" hidden>
+    <div class="pop-title">Eraser</div>
+    <div class="seg" id="erase-seg" role="group" aria-label="How the eraser deletes">
+      <button data-m="stroke">Whole lines</button><button data-m="cut">Cut through</button>
+    </div>
+    <p class="erase-note" id="erase-note"></p>
+  </div>
   <label class="smooth">
     <span>Smoothing <b id="smooth-val">0</b></span>
     <input type="range" id="smooth-range" min="0" max="100" step="1">
@@ -141,6 +170,8 @@
 </div>
 
 <div class="chips">
+  <button class="chip prompt" id="prompt-chip" hidden></button>
+  <button class="chip" id="zoom-chip" hidden></button>
   <button class="chip" id="save-chip" tabindex="-1">Saved</button>
   <button class="chip" id="drive-chip">Drive off</button>
 </div>
@@ -156,7 +187,14 @@
     <div class="row">
       <button class="btn primary" id="m-new">New drawing</button>
       <button class="btn" id="m-list">Your drawings</button>
-      <button class="btn" id="m-export">Download JSON</button>
+      <button class="btn" id="m-prompt">Start a session</button>
+    </div>
+    <div class="sep"></div>
+    <h3>Watch and export</h3>
+    <div class="row">
+      <button class="btn" id="m-replay">Replay</button>
+      <button class="btn" id="m-image">Export image</button>
+      <button class="btn" id="m-export">Download data (JSON)</button>
     </div>
     <div class="sep"></div>
     <h3>Google Drive</h3>
@@ -169,7 +207,15 @@
     <h3>This device</h3>
     <label>Name <input id="m-dev-name" list="dev-names"></label>
     <p id="m-dev-scale"></p>
-    <label>Pen pressure setting <input id="m-dev-pressure" placeholder="e.g. Wacom feel: default"></label>
+    <label>Tablet driver setting, as a note <input id="m-dev-pressure" placeholder="e.g. Wacom tip feel: default"></label>
+    <div class="feel">
+      <label for="m-feel">Pressure feel</label>
+      <svg viewBox="0 0 100 60" preserveAspectRatio="none" aria-hidden="true"><line x1="0" y1="60" x2="100" y2="0" class="diag"/><polyline id="feel-curve" points=""/></svg>
+      <input type="range" id="m-feel" min="-100" max="100" step="5">
+      <div class="feel-ends"><span>Light touch</span><span>Firm touch</span></div>
+      <p>How hard you press for ink pen and brush pen to reach full width. Recorded pressure is not changed.</p>
+    </div>
+    <label class="check"><input type="checkbox" id="m-penbtn"> Pen side button marks figures</label>
     <label class="check"><input type="checkbox" id="m-touch"> Finger moves and zooms the page</label>
     <label class="check"><input type="checkbox" id="m-diag"> Show live pen data</label>
     <div class="row"><button class="btn" id="m-calib">Calibrate size</button></div>
@@ -196,9 +242,12 @@
   <div class="sheet">
     <h2>New drawing</h2>
     <label>Paper
-      <select id="n-paper"><option>A5</option><option selected>A4</option><option>A3</option></select>
+      <select id="n-paper">
+        <option>A5</option><option selected>A4</option><option>A3</option><option>A2</option><option>A1</option>
+        <option value="Square">Square, 30 × 30 cm</option><option value="Endless">Endless page</option>
+      </select>
     </label>
-    <label>Orientation
+    <label id="n-orient-row">Orientation
       <select id="n-orient"><option value="p">Portrait</option><option value="l">Landscape</option></select>
     </label>
     <label>Title <input id="n-title" placeholder="Optional"></label>
@@ -235,6 +284,53 @@
     <div class="row"><button class="btn primary" id="c-save">Save calibration</button><button class="btn" id="c-cancel">Cancel</button></div>
   </div>
 </dialog>
+
+<dialog id="export-dlg">
+  <div class="sheet">
+    <h2>Export image</h2>
+    <label>Format
+      <select id="x-format"><option value="png">PNG image</option><option value="svg">SVG vector</option></select>
+    </label>
+    <label id="x-res-row">Resolution
+      <select id="x-res"><option value="150">150 dpi, for screens</option><option value="300" selected>300 dpi, for print</option><option value="600">600 dpi, for large prints</option></select>
+    </label>
+    <label class="check"><input type="checkbox" id="x-transparent"> Transparent background</label>
+    <p id="x-info"></p>
+    <div class="row"><button class="btn primary" id="x-save">Download</button><button class="btn" id="x-share" hidden>Share</button><button class="btn" id="x-cancel">Cancel</button></div>
+  </div>
+</dialog>
+
+<dialog id="prompt-dlg">
+  <div class="sheet">
+    <h2>Start a session</h2>
+    <p>The prompt and time limit are saved with every stroke you draw during the session, so these drawings can be compared later.</p>
+    <label>Prompt
+      <select id="pr-kind">
+        <option>Free drawing</option><option>Figures only</option><option>Fringe and texture</option>
+        <option>Fast gestures</option><option>Slow and deliberate</option><option>Continue an older drawing</option>
+        <option value="custom">Your own prompt</option>
+      </select>
+    </label>
+    <label id="pr-custom-row" hidden>Your prompt <input id="pr-custom" placeholder="Heads emerging from roots"></label>
+    <label>Time
+      <select id="pr-min"><option value="0">No limit</option><option value="5">5 minutes</option><option value="10" selected>10 minutes</option><option value="20">20 minutes</option><option value="30">30 minutes</option><option value="60">60 minutes</option></select>
+    </label>
+    <label class="check"><input type="checkbox" id="pr-new" checked> Start on a new page</label>
+    <div class="row"><button class="btn primary" id="pr-start">Start</button><button class="btn" id="pr-cancel">Cancel</button></div>
+  </div>
+</dialog>
+
+<div id="replay-bar" hidden>
+  <button class="btn primary" id="rp-play">Pause</button>
+  <input type="range" id="rp-seek" min="0" max="1000" step="1" aria-label="Position in the replay">
+  <span id="rp-time"></span>
+  <select id="rp-speed" aria-label="Speed">
+    <option value="1">1×</option><option value="2">2×</option><option value="4">4×</option><option value="8">8×</option><option value="16">16×</option><option value="32">32×</option><option value="64">64×</option>
+  </select>
+  <label class="check"><input type="checkbox" id="rp-skip" checked> Skip pauses</label>
+  <span id="rp-info"></span>
+  <button class="btn" id="rp-close">Close</button>
+</div>
 
 <datalist id="dev-names">
   <option value="Wacom on PC"><option value="Galaxy Tab S7"><option value="Galaxy S26 Ultra">
