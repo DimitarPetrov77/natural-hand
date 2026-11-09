@@ -8,7 +8,7 @@
 'use strict';
 (() => {
 
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.1.1';
 const FORMAT = 'natural-hand/1';
 const SAMPLE_FIELDS = ['dt_ms','x_mm','y_mm','pressure','tiltX','tiltY','twist','altitude','azimuth','tangential','width_px','height_px','buttons'];
 const PAPERS = { A5:[148,210], A4:[210,297], A3:[297,420] };
@@ -123,6 +123,7 @@ function requestRender() { if (!renderQueued) { renderQueued = true; requestAnim
 function render() {
   renderQueued = false;
   vctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (S.paper && sharpKey === viewKey()) { vctx.drawImage(sharp, 0, 0); return; }
   vctx.fillStyle = surround;
   vctx.fillRect(0, 0, view.width, view.height);
   if (!S.paper) return;
@@ -134,6 +135,71 @@ function render() {
   vctx.imageSmoothingEnabled = true;
   vctx.imageSmoothingQuality = 'high';
   vctx.drawImage(S.paper.c, 0, 0, W, H);
+  scheduleSharp();
+}
+
+/* Sharp layer: when the view stops moving, strokes in view are redrawn from their
+ * vector samples at full screen resolution, so ink stays crisp at any zoom.
+ * While panning or zooming, the cached page bitmap is shown instead. */
+const sharp = document.createElement('canvas');
+const sctx = sharp.getContext('2d', { alpha: false });
+let sharpKey = null, sharpTimer = 0;
+const BB = new WeakMap();
+function viewKey() { const v = S.view; return `${v.s}|${v.r}|${v.tx}|${v.ty}|${view.width}|${view.height}|${S.ppmm}|${surround}`; }
+function invalidateSharp() { sharpKey = null; }
+function scheduleSharp() { clearTimeout(sharpTimer); sharpTimer = setTimeout(renderSharp, 120); }
+function applyView(ctx) {
+  const v = S.view, k = S.ppmm * v.s;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.translate(v.tx, v.ty); ctx.rotate(v.r); ctx.scale(k, k);
+}
+function bboxOf(st) {
+  const n = st.samples.length;
+  let b = BB.get(st);
+  if (b && b.n === n) return b;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const r of st.samples) { if (r[1] < x0) x0 = r[1]; if (r[1] > x1) x1 = r[1]; if (r[2] < y0) y0 = r[2]; if (r[2] > y1) y1 = r[2]; }
+  const h = st.width_mm / 2;
+  b = { x0: x0 - h, y0: y0 - h, x1: x1 + h, y1: y1 + h, n };
+  BB.set(st, b);
+  return b;
+}
+function visibleDocRect() {
+  const c = [screenToDoc(0, 0), screenToDoc(cw, 0), screenToDoc(0, ch), screenToDoc(cw, ch)];
+  return { x0: Math.min(...c.map((p) => p[0])), x1: Math.max(...c.map((p) => p[0])), y0: Math.min(...c.map((p) => p[1])), y1: Math.max(...c.map((p) => p[1])) };
+}
+function clipPaper(ctx) { const [W, H] = S.paperSize; ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip(); }
+function renderSharp() {
+  if (!S.paper) return;
+  if (gesture || mousePan) { scheduleSharp(); return; }
+  if (sharp.width !== view.width || sharp.height !== view.height) { sharp.width = view.width; sharp.height = view.height; }
+  sctx.setTransform(1, 0, 0, 1, 0, 0);
+  sctx.fillStyle = surround;
+  sctx.fillRect(0, 0, sharp.width, sharp.height);
+  applyView(sctx);
+  const [W, H] = S.paperSize;
+  sctx.fillStyle = '#ffffff';
+  sctx.fillRect(0, 0, W, H);
+  sctx.save(); clipPaper(sctx);
+  const r = visibleDocRect();
+  for (const st of S.strokes) {
+    if (st.undone_at) continue;
+    const b = bboxOf(st);
+    if (b.x1 < r.x0 || b.x0 > r.x1 || b.y1 < r.y0 || b.y0 > r.y1) continue;
+    drawStroke(sctx, st);
+  }
+  sctx.restore();
+  sharpKey = viewKey();
+  requestRender();
+}
+// draw new ink into the page bitmap and, if it is current, the sharp layer
+function inkLive(st, from = 0) {
+  drawStroke(S.paper.x, st, from);
+  if (sharpKey === viewKey()) {
+    applyView(sctx); sctx.save(); clipPaper(sctx);
+    drawStroke(sctx, st, from);
+    sctx.restore();
+  }
 }
 
 function screenToDoc(sx, sy, v = S.view) {
@@ -201,6 +267,7 @@ function paintAll(ctx, strokes, W, H, K) {
 function repaint() {
   const { x, K } = S.paper;
   paintAll(x, S.strokes, S.paperSize[0], S.paperSize[1], K);
+  invalidateSharp();
   requestRender();
 }
 
@@ -293,7 +360,7 @@ function onDown(e) {
   S.strokes.push(st);
   S.redo.length = 0;
   view.setPointerCapture(e.pointerId);
-  drawStroke(S.paper.x, st);
+  inkLive(st);
   requestRender();
   S.lastPen = performance.now();
   Diag.down(e);
@@ -315,7 +382,7 @@ function onMove(e) {
   if (S.active && e.pointerId === S.active.id) {
     const st = S.active.st, from = st.samples.length;
     for (const ce of list) st.samples.push(sampleOf(ce, st.t0));
-    drawStroke(S.paper.x, st, from);
+    inkLive(st, from);
     requestRender();
     S.lastPen = performance.now();
     Diag.move(e, list.length);
@@ -345,7 +412,7 @@ function finish(e, cancelled) {
   else {
     const from = st.samples.length;
     st.samples.push(sampleOf(e, st.t0)); // pen-up event (pressure 0)
-    drawStroke(S.paper.x, st, from);
+    inkLive(st, from);
   }
   S.active = null;
   S.lastPen = performance.now();
@@ -954,7 +1021,7 @@ function bindUI() {
   });
   addEventListener('keyup', (e) => { if (e.key === ' ') { spaceDown = false; view.style.cursor = ''; } });
   addEventListener('resize', () => { resize(); hideNibs(); });
-  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { readSurround(); requestRender(); });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { readSurround(); invalidateSharp(); requestRender(); });
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushMeta(); });
   addEventListener('pagehide', () => flushMeta());
   addEventListener('online', () => autoSync());
