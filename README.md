@@ -49,8 +49,10 @@ Then open the menu, turn on **Show live pen data**, and draw a few lines. The pa
 | Action | Pen and touch | Keyboard |
 |---|---|---|
 | Draw | pen | mouse also works |
+| Pen type: technical, ink pen, brush pen | width button, top row | B |
 | Pen width (0.1 to 2.0 mm) | width button | 1 to 7 |
-| Eraser | eraser button, or the Wacom eraser end | E |
+| Smoothing (0 to 100) | slider under the widths | [ and ] |
+| Eraser (0.5 to 8 mm, own width) | eraser button, or the Wacom eraser end | E |
 | Undo / redo | arrows | Ctrl+Z / Ctrl+Shift+Z |
 | Mark a figure | figure button, press again when the figure is done | F |
 | Mark black fill | fill button | G |
@@ -63,6 +65,12 @@ Finger touches are ignored for a moment after the pen was near the screen, so a 
 **Mark your figures.** Press the figure button when you start a body and again when it is finished. Every stroke in between gets that figure's number. This is how the generator will learn your figures as their own thing, so it is worth the second it takes. Mark solid black fills the same way, so scrubbing strokes do not distort the speed and pressure statistics.
 
 Undo never deletes data: undone strokes stay in the file, marked with the time they were undone.
+
+**Pen types.** Technical pen keeps one width. Ink pen and brush pen change width with pressure: ink pen gently, brush pen strongly, with thin starts and ends. The pressure itself is recorded the same way for all three.
+
+**Eraser.** It cuts the ink it passes over, in the data as well as on screen. Erased parts are marked on the stroke they belong to (`erased`) and left out of the final drawing. The ink is kept underneath, so undoing the eraser brings it back, and the eraser strokes themselves stay in the file as part of how you work.
+
+**Smoothing.** It changes the recorded line, not just the screen: `samples` holds the smoothed path you see. When smoothing is above 0, the unsmoothed device samples are kept next to it as `raw`, so nothing about your real movement is lost. Smoothing is time-based, so a level feels the same on the Wacom, the tablet and the phone.
 
 ## 6. Data format
 
@@ -78,14 +86,16 @@ One file per drawing: `<id>.json.gz` in Drive (plain `<id>.json` from Download J
       "i", "session", "t0" (epoch ms), "tool", "width_mm", "figure", "tags", "pointer_type",
       "view": [zoom, rotation_rad, tx, ty], "ppmm",
       "hover": [ [dt_ms (negative), x_mm, y_mm, ...], ... ],
-      "samples": [ [dt_ms, x_mm, y_mm, pressure, ...], ... ],
+      "samples": [ [dt_ms, x_mm, y_mm, pressure, ...], ... ],   (the drawn, smoothed path)
+      "raw": [ ... ],                                          (device samples, when smoothing > 0)
+      "brush", "smoothing", "smoothing_tau_ms", "erased": [[first, last, eraser_i], ...],
       "undone_at", "cancelled"
   } ],
   "events": [ { "t", "type": "undo" | "redo" | "figure_start" | "figure_end" | "fill_start" | "fill_end", ... } ]
 }
 ```
 
-Positions are paper millimetres from the top-left corner. Samples are recorded exactly as the device delivers them, with no smoothing or resampling, and every coalesced sample is kept. The last sample of each stroke is the pen-up event (pressure 0). Each stroke carries the page view at that moment, so its screen-space and physical movement can be reconstructed: `screen_px = R(rotation) * (mm * ppmm * zoom) + (tx, ty)`.
+Positions are paper millimetres from the top-left corner. Every coalesced sample the device delivers is kept, with no resampling; `raw` (or `samples` when smoothing was 0) is exactly what the device reported. The last sample of each stroke is the pen-up event (pressure 0). Each stroke carries the page view at that moment, so its screen-space and physical movement can be reconstructed: `screen_px = R(rotation) * (mm * ppmm * zoom) + (tx, ty)`.
 
 `tools/load.py` reads these files into NumPy arrays:
 

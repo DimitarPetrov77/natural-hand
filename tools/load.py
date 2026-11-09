@@ -28,9 +28,13 @@ class Stroke:
     session: str
     undone: bool
     cancelled: bool
-    samples: np.ndarray       # (n, len(fields)), nulls become NaN
+    samples: np.ndarray       # drawn path (smoothed positions), (n, len(fields)), nulls become NaN
     hover: np.ndarray         # pen in the air before this stroke, dt negative
     fields: list = field(repr=False)
+    raw: np.ndarray = None    # device samples before smoothing (same as samples when smoothing was 0)
+    brush: str = "technical"
+    smoothing_tau_ms: float = 0.0
+    erased: list = field(default_factory=list)   # [[first, last, eraser_i], ...]
 
     def col(self, name, which="samples"):
         return getattr(self, which)[:, self.fields.index(name)]
@@ -41,6 +45,21 @@ class Stroke:
     def xy(self): return self.samples[:, 1:3]
     @property
     def pressure(self): return self.col("pressure")
+    def visible_segments(self):
+        """Pieces of the drawn path that survive erasing (list of arrays)."""
+        if self.tool == "eraser" or self.undone:
+            return []
+        keep = np.ones(len(self.samples), bool)
+        for a, b, *_ in self.erased:
+            keep[a:b + 1] = False
+        out, start = [], None
+        for i, k in enumerate(np.append(keep, False)):
+            if k and start is None:
+                start = i
+            elif not k and start is not None:
+                out.append(self.samples[start:i]); start = None
+        return out
+
     @property
     def drawn(self):
         """Samples while the pen touched the paper (drops the pen-up event)."""
@@ -56,8 +75,8 @@ class Drawing:
     events: list
 
     def visible(self):
-        """Strokes that are on the page (not undone)."""
-        return [s for s in self.strokes if not s.undone]
+        """Ink strokes on the page (not undone, not eraser strokes)."""
+        return [s for s in self.strokes if not s.undone and s.tool != "eraser"]
 
 
 def _arr(rows, width):
@@ -80,7 +99,10 @@ def load_drawing(path) -> Drawing:
             i=s["i"], t0=s["t0"], tool=s["tool"], width_mm=s["width_mm"], figure=s.get("figure"),
             tags=s.get("tags", []), pointer_type=s.get("pointer_type", ""), session=s.get("session", ""),
             undone=s.get("undone_at") is not None, cancelled=bool(s.get("cancelled")),
-            samples=_arr(s["samples"], len(fields)), hover=_arr(hov, len(fields)), fields=fields))
+            samples=_arr(s["samples"], len(fields)), hover=_arr(hov, len(fields)), fields=fields,
+            raw=_arr(s["raw"], len(fields)) if s.get("raw") else _arr(s["samples"], len(fields)),
+            brush=s.get("brush") or "technical", smoothing_tau_ms=s.get("smoothing_tau_ms") or 0.0,
+            erased=s.get("erased") or []))
     meta = {k: v for k, v in d.items() if k not in ("strokes", "events")}
     return Drawing(d["id"], meta, fields, strokes, d.get("events", []))
 

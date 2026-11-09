@@ -43,8 +43,17 @@
 
   .pop{position:fixed;z-index:4;background:var(--rail);border-radius:12px;padding:6px;display:flex;gap:2px;
     box-shadow:0 0 0 1px var(--line),0 6px 20px rgba(0,0,0,.25)}
+  .pop{flex-direction:column;gap:6px;padding:8px}
   .pop[hidden]{display:none}
-  @media (orientation:landscape){.pop{flex-direction:column}}
+  .pop .nibs{display:flex;gap:2px}
+  @media (orientation:landscape){.pop .nibs{flex-direction:column}}
+  .pop .seg{display:flex;gap:2px;min-width:240px;background:var(--line);border-radius:9px;padding:2px}
+  .pop .seg button{flex:1;min-height:34px;padding:4px 8px;font:inherit;font-size:12px;border-radius:7px;white-space:nowrap;flex-direction:row}
+  .pop .seg button[aria-pressed="true"]{background:var(--rail);color:var(--ink);box-shadow:0 0 0 1px var(--line)}
+  .pop-title{font-size:12px;color:var(--muted);padding:0 4px}
+  .pop .smooth{display:grid;gap:2px;padding:4px 4px 2px;font-size:12px;color:var(--muted);min-width:180px}
+  .pop .smooth b{color:var(--ink);font-variant-numeric:tabular-nums;font-weight:600}
+  .pop .smooth input{width:100%;accent-color:var(--ink)}
   .pop button{border:0;background:transparent;color:inherit;border-radius:8px;padding:6px 10px;display:flex;align-items:center;gap:10px;cursor:pointer;min-width:44px;min-height:40px}
   @media (orientation:portrait){.pop button{flex-direction:column;gap:4px;padding:6px 4px}}
   .pop button[aria-pressed="true"]{background:var(--ink);color:var(--rail)}
@@ -109,7 +118,7 @@
 <canvas id="view" aria-label="Drawing canvas"></canvas>
 
 <nav class="rail" id="rail" aria-label="Tools">
-  <button id="nib-btn" title="Pen width (1–7)" aria-haspopup="true"></button>
+  <button id="nib-btn" title="Width and smoothing (1–7, [ ])" aria-haspopup="true"></button>
   <button id="eraser-btn" title="Eraser (E)" aria-pressed="false"></button>
   <button id="undo-btn" title="Undo (Ctrl+Z)"></button>
   <button id="redo-btn" title="Redo (Ctrl+Shift+Z)"></button>
@@ -119,7 +128,17 @@
   <button id="fit-btn" title="Fit page (0)"></button>
   <button id="menu-btn" title="Menu"></button>
 </nav>
-<div class="pop" id="nib-pop" hidden role="menu" aria-label="Pen width"></div>
+<div class="pop" id="nib-pop" hidden aria-label="Pen settings">
+  <div class="seg" id="brush-seg" role="group" aria-label="Pen type">
+    <button data-b="technical">Technical</button><button data-b="ink">Ink pen</button><button data-b="brush">Brush pen</button>
+  </div>
+  <div class="pop-title" id="nib-title">Width, mm</div>
+  <div class="nibs" id="nib-list" role="menu"></div>
+  <label class="smooth">
+    <span>Smoothing <b id="smooth-val">0</b></span>
+    <input type="range" id="smooth-range" min="0" max="100" step="1">
+  </label>
+</div>
 
 <div class="chips">
   <button class="chip" id="save-chip" tabindex="-1">Saved</button>

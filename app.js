@@ -8,11 +8,19 @@
 'use strict';
 (() => {
 
-const APP_VERSION = '0.2.0';
+const APP_VERSION = '0.4.0';
 const FORMAT = 'natural-hand/1';
 const SAMPLE_FIELDS = ['dt_ms','x_mm','y_mm','pressure','tiltX','tiltY','twist','altitude','azimuth','tangential','width_px','height_px','buttons'];
 const PAPERS = { A5:[148,210], A4:[210,297], A3:[297,420] };
 const NIBS = [0.1, 0.2, 0.3, 0.5, 0.8, 1.2, 2.0];
+const ERASERS = [0.5, 1, 2, 4, 8];
+const BRUSHES = {
+  technical: { label: 'Technical', width: () => 1 },
+  ink:       { label: 'Ink pen',   width: (p) => 0.5 + 0.8 * p },
+  brush:     { label: 'Brush pen', width: (p) => 0.08 + 2.2 * Math.pow(p, 1.3) },
+};
+const SMOOTH_MAX_TAU = 150;    // ms of smoothing lag at level 100
+const tauFor = (level) => rnd(SMOOTH_MAX_TAU * Math.pow(clamp(level || 0, 0, 100) / 100, 1.5), 2);
 const MAX_BITMAP = 4096;       // paper bitmap edge, px (mobile canvas limit safe)
 const PALM_MS = 800;           // ignore finger touches this long after pen activity
 const HOVER_LIMIT = 30000;     // max hover samples kept between two strokes
@@ -106,6 +114,9 @@ const S = {
   view: { s: 1, r: 0, tx: 0, ty: 0 },
   tool: 'pen',
   width: 0.3,
+  eraserWidth: 2,
+  brush: 'technical',
+  smoothing: 0,
   figure: null,
   fill: false,
   active: null,        // {st, id}
@@ -198,7 +209,7 @@ function renderSharp() {
   sctx.save(); clipPaper(sctx);
   const r = visibleDocRect();
   for (const st of S.strokes) {
-    if (st.undone_at) continue;
+    if (!visibleInk(st)) continue;
     const b = bboxOf(st);
     if (b.x1 < r.x0 || b.x0 > r.x1 || b.y1 < r.y0 || b.y0 > r.y1) continue;
     drawStroke(sctx, st);
@@ -255,29 +266,152 @@ function makePaper(W, H) {
   return { c, x, K };
 }
 function inkOf(st) { return st.tool === 'eraser' ? '#ffffff' : '#000000'; }
+/* Smoothing: `raw` keeps exactly what the device reported; `samples` is the smoothed
+ * path that is drawn and analysed. Positions pass through a time-based exponential
+ * filter (time constant smoothing_tau_ms), so a level feels the same on every device.
+ * The pen-up sample lands on the real end point. */
+function smoothStep(sm, r, tau) {
+  if (!sm.started || tau <= 0) { sm.ex = r[1]; sm.ey = r[2]; sm.started = true; }
+  else { const a = 1 - Math.exp(-Math.max(0, r[0] - sm.t) / tau); sm.ex += (r[1] - sm.ex) * a; sm.ey += (r[2] - sm.ey) * a; }
+  sm.t = r[0];
+  const out = r.slice(); out[1] = rnd(sm.ex, 4); out[2] = rnd(sm.ey, 4);
+  return out;
+}
+function smoothRows(raw, tau, complete) {
+  const sm = {}, out = raw.map((r) => smoothStep(sm, r, tau));
+  if (complete && out.length) { const l = raw[raw.length - 1]; out[out.length - 1] = l.slice(); }
+  return out;
+}
+// strokes from older versions: v0.3 stored raw positions with display-only smoothing
+function normalizeStroke(st) {
+  if (st.smoothing_tau_ms > 0 && !st.raw) { st.raw = st.samples; st.samples = smoothRows(st.raw, st.smoothing_tau_ms, !st.cancelled); }
+  if (!st.brush) st.brush = 'technical';
+  return st;
+}
+
+// per-sample widths (mm) from pressure, lightly smoothed so the line does not wobble
+const WD = new WeakMap();
+function widthsOf(st) {
+  const n = st.samples.length, fn = (BRUSHES[st.brush] || BRUSHES.technical).width;
+  let c = WD.get(st);
+  if (!c || c.n > n) { c = { n: 0, w: [], p: null, t: 0 }; WD.set(st, c); }
+  for (let i = c.n; i < n; i++) {
+    const r = st.samples[i];
+    let p = r[3];
+    if (st.pointer_type === 'mouse' && p > 0) p = 0.5;
+    if (c.p == null) c.p = p;
+    else { const a = 1 - Math.exp(-Math.max(0, r[0] - c.t) / 12); c.p += (p - c.p) * a; }
+    c.t = r[0];
+    c.w.push(Math.max(0.02, st.width_mm * fn(clamp(c.p, 0, 1))));
+  }
+  c.n = n;
+  return c.w;
+}
+// erased sample ranges -> mask
+const EM = new WeakMap();
+function erasedMask(st) {
+  if (!st.erased || !st.erased.length) return null;
+  let m = EM.get(st);
+  if (m && m.src === st.erased && m.n === st.samples.length) return m.mask;
+  const mask = new Uint8Array(st.samples.length);
+  for (const [a, b] of st.erased) for (let i = a; i <= b && i < mask.length; i++) mask[i] = 1;
+  EM.set(st, { src: st.erased, n: st.samples.length, mask });
+  return mask;
+}
 function drawStroke(ctx, st, from = 0) {
-  const s = st.samples, n = s.length;
+  const P = st.samples, n = P.length;
   if (!n) return;
+  const eraser = st.tool === 'eraser';
+  const W = eraser || st.brush === 'technical' ? null : widthsOf(st);
+  const M = eraser ? null : erasedMask(st);
+  const wAt = (i) => (W ? W[i] : st.width_mm);
   ctx.strokeStyle = ctx.fillStyle = inkOf(st);
-  ctx.lineWidth = st.width_mm;
   ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-  if (from === 0) {
-    ctx.beginPath(); ctx.arc(s[0][1], s[0][2], st.width_mm / 2, 0, Math.PI * 2); ctx.fill();
-    if (n === 1) return;
+  if (from === 0 && !(M && M[0])) {
+    ctx.beginPath(); ctx.arc(P[0][1], P[0][2], wAt(0) / 2, 0, Math.PI * 2); ctx.fill();
   }
   const a = Math.max(1, from);
   if (a >= n) return;
-  ctx.beginPath();
-  ctx.moveTo(s[a - 1][1], s[a - 1][2]);
-  for (let i = a; i < n; i++) ctx.lineTo(s[i][1], s[i][2]);
-  ctx.stroke();
+  // consecutive segments with the same (quantized) width share one path
+  let open = false, cw = -1;
+  const q = st.width_mm * 0.04;
+  for (let i = a; i < n; i++) {
+    if (M && (M[i] || M[i - 1])) { if (open) { ctx.stroke(); open = false; } continue; }
+    const w = W ? Math.max(0.02, Math.round(((W[i - 1] + W[i]) / 2) / q) * q) : st.width_mm;
+    if (!open || w !== cw) {
+      if (open) ctx.stroke();
+      ctx.beginPath(); ctx.lineWidth = w; cw = w; ctx.moveTo(P[i - 1][1], P[i - 1][2]); open = true;
+    }
+    ctx.lineTo(P[i][1], P[i][2]);
+  }
+  if (open) ctx.stroke();
+}
+const visibleInk = (st) => !st.undone_at && (st.tool !== 'eraser' || (S.active && S.active.st === st));
+
+/* Vector eraser: an eraser stroke marks the samples of earlier strokes that it passes
+ * over (st.erased = [[from, to, eraser_i], ...]). The ink data stays, marked as erased,
+ * so undoing the eraser brings it back and the history of corrections is kept. */
+function computeErasure(strokes) {
+  const result = new Map();
+  for (const E of strokes) {
+    if (E.tool !== 'eraser' || E.undone_at || !E.samples.length) continue;
+    const r = E.width_mm / 2, eb = bboxOf(E), cell = Math.max(r * 2, 0.5), grid = new Map();
+    const key = (cx, cy) => cx * 100003 + cy;
+    const segs = E.samples.length === 1 ? [[0, 0]] : E.samples.slice(1).map((_, i) => [i, i + 1]);
+    for (const [i0, i1] of segs) {
+      const A = E.samples[i0], B = E.samples[i1];
+      const x0 = Math.floor((Math.min(A[1], B[1]) - r) / cell), x1 = Math.floor((Math.max(A[1], B[1]) + r) / cell);
+      const y0 = Math.floor((Math.min(A[2], B[2]) - r) / cell), y1 = Math.floor((Math.max(A[2], B[2]) + r) / cell);
+      for (let cx = x0; cx <= x1; cx++) for (let cy = y0; cy <= y1; cy++) {
+        const k = key(cx, cy); if (!grid.has(k)) grid.set(k, []); grid.get(k).push([A, B]);
+      }
+    }
+    for (const T of strokes) {
+      if (T.tool === 'eraser' || T.undone_at || T.t0 >= E.t0) continue;
+      const tb = bboxOf(T);
+      if (tb.x1 < eb.x0 || tb.x0 > eb.x1 || tb.y1 < eb.y0 || tb.y0 > eb.y1) continue;
+      const hit = [];
+      T.samples.forEach((p, idx) => {
+        const list = grid.get(key(Math.floor(p[1] / cell), Math.floor(p[2] / cell)));
+        if (!list) return;
+        for (const [A, B] of list) {
+          const dx = B[1] - A[1], dy = B[2] - A[2], L = dx * dx + dy * dy;
+          const t = L ? clamp(((p[1] - A[1]) * dx + (p[2] - A[2]) * dy) / L, 0, 1) : 0;
+          if (Math.hypot(p[1] - (A[1] + t * dx), p[2] - (A[2] + t * dy)) <= r) { hit.push(idx); break; }
+        }
+      });
+      if (!hit.length) continue;
+      if (!result.has(T)) result.set(T, []);
+      const ranges = result.get(T);
+      let a0 = hit[0], prev = hit[0];
+      for (let k = 1; k <= hit.length; k++) {
+        if (k < hit.length && hit[k] === prev + 1) { prev = hit[k]; continue; }
+        ranges.push([a0, prev, E.i]);
+        if (k < hit.length) { a0 = prev = hit[k]; }
+      }
+    }
+  }
+  const changed = [];
+  for (const T of strokes) {
+    if (T.tool === 'eraser') continue;
+    const nr = result.get(T) || null;
+    const was = T.erased && T.erased.length ? JSON.stringify(T.erased) : null;
+    const now = nr ? JSON.stringify(nr) : null;
+    if (was !== now) { T.erased = nr; changed.push(T); }
+  }
+  return changed;
+}
+function applyErasure() {
+  const changed = computeErasure(S.strokes);
+  for (const st of changed) saveStroke(st);
+  return changed.length;
 }
 function paintAll(ctx, strokes, W, H, K) {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
   ctx.setTransform(K, 0, 0, K, 0, 0);
-  for (const st of strokes) if (!st.undone_at) drawStroke(ctx, st);
+  for (const st of strokes) if (visibleInk(st)) drawStroke(ctx, st);
 }
 function repaint() {
   const { x, K } = S.paper;
@@ -359,7 +493,10 @@ function onDown(e) {
     t0,
     tool: eraserEnd ? 'eraser' : S.tool,
     eraser_end: eraserEnd,
-    width_mm: S.width,
+    width_mm: eraserEnd || S.tool === 'eraser' ? S.eraserWidth : S.width,
+    brush: eraserEnd || S.tool === 'eraser' ? null : S.brush,
+    smoothing: S.smoothing,
+    smoothing_tau_ms: tauFor(S.smoothing),
     figure: S.figure,
     tags: S.fill ? ['fill'] : [],
     pointer_type: e.pointerType,
@@ -367,11 +504,14 @@ function onDown(e) {
     ppmm: rnd(S.ppmm, 5),
     hover: h,
     hover_dropped: dropped,
-    samples: [sampleOf(e, t0)],
+    samples: [],
     undone_at: null,
     cancelled: false,
   };
-  S.active = { st, id: e.pointerId };
+  const r0 = sampleOf(e, t0), sm = {};
+  if (st.smoothing_tau_ms > 0) st.raw = [r0];
+  st.samples.push(smoothStep(sm, r0, st.smoothing_tau_ms));
+  S.active = { st, id: e.pointerId, sm };
   S.strokes.push(st);
   S.redo.length = 0;
   view.setPointerCapture(e.pointerId);
@@ -395,8 +535,12 @@ function onMove(e) {
   }
   const list = coalesced(e);
   if (S.active && e.pointerId === S.active.id) {
-    const st = S.active.st, from = st.samples.length;
-    for (const ce of list) st.samples.push(sampleOf(ce, st.t0));
+    const st = S.active.st, from = st.samples.length, tau = st.smoothing_tau_ms;
+    for (const ce of list) {
+      const r = sampleOf(ce, st.t0);
+      if (st.raw) st.raw.push(r);
+      st.samples.push(smoothStep(S.active.sm, r, tau));
+    }
     inkLive(st, from);
     requestRender();
     S.lastPen = performance.now();
@@ -423,13 +567,16 @@ function onCancel(e) {
 }
 function finish(e, cancelled) {
   const st = S.active.st;
+  const from = st.samples.length;
   if (cancelled) st.cancelled = true;
   else {
-    const from = st.samples.length;
-    st.samples.push(sampleOf(e, st.t0)); // pen-up event (pressure 0)
-    inkLive(st, from);
+    const r = sampleOf(e, st.t0); // pen-up event (pressure 0), drawn at the pen's real end point
+    if (st.raw) st.raw.push(r);
+    st.samples.push(r.slice());
   }
   S.active = null;
+  if (st.tool === 'eraser') { applyErasure(); repaint(); }
+  else inkLive(st, from);
   S.lastPen = performance.now();
   saveStroke(st);
   markChanged();
@@ -482,6 +629,7 @@ function undo() {
       st.undone_at = rnd(absNow(), 3);
       S.redo.push(i);
       saveStroke(st); logEvent('undo', { stroke: i });
+      if (st.tool === 'eraser') applyErasure();
       repaint(); markChanged(); updateTools();
       return;
     }
@@ -492,10 +640,17 @@ function redo() {
   const i = S.redo.pop(), st = S.strokes[i];
   st.undone_at = null;
   saveStroke(st); logEvent('redo', { stroke: i });
+  if (st.tool === 'eraser') applyErasure();
   repaint(); markChanged(); updateTools();
 }
-function setNib(w) { S.width = w; localStorage.setItem('nh-nib', String(w)); updateTools(); }
-function toggleEraser() { S.tool = S.tool === 'eraser' ? 'pen' : 'eraser'; updateTools(); }
+function setNib(w) {
+  if (S.tool === 'eraser') { S.eraserWidth = w; localStorage.setItem('nh-eraser', String(w)); }
+  else { S.width = w; localStorage.setItem('nh-nib', String(w)); }
+  updateTools();
+}
+function setBrush(b) { if (BRUSHES[b]) { S.brush = b; localStorage.setItem('nh-brush', b); if (S.tool === 'eraser') { S.tool = 'pen'; buildNibs(); } updateTools(); } }
+function setSmoothing(v) { S.smoothing = clamp(Math.round(v), 0, 100); localStorage.setItem('nh-smooth', String(S.smoothing)); updateTools(); }
+function toggleEraser() { S.tool = S.tool === 'eraser' ? 'pen' : 'eraser'; buildNibs(); updateTools(); }
 function toggleFigure() {
   if (!S.meta) return;
   if (S.figure == null) {
@@ -562,12 +717,13 @@ async function openDrawing(id) {
   if (S.meta) await flushMeta();
   const meta = await DB.get('drawings', id);
   if (!meta) { toast('That drawing is no longer on this device.'); return; }
-  const strokes = (await DB.strokes(id)).sort((a, b) => a.i - b.i);
+  const strokes = (await DB.strokes(id)).sort((a, b) => a.i - b.i).map(normalizeStroke);
   Object.assign(S, {
     meta, strokes, redo: [], figure: null, fill: false, hover: [], hoverDropped: 0, active: null,
     paperSize: [meta.paper.w_mm, meta.paper.h_mm], sessionId: `${Date.now().toString(36)}-${uid()}`, sessionLogged: false,
   });
   S.paper = makePaper(meta.paper.w_mm, meta.paper.h_mm);
+  applyErasure();
   repaint();
   localStorage.setItem('nh-last', id);
   if (meta.view) S.view = { ...meta.view }; else fit();
@@ -603,6 +759,10 @@ async function buildExport(id) {
       last_sample: 'the final sample of a stroke is the pen-up event (pressure 0) unless the stroke was cancelled',
       angles: 'tiltX, tiltY, twist in degrees; altitude, azimuth in radians; null when the browser does not report them',
       view: '[zoom, rotation_rad, tx_px, ty_px]; screen_css_px = R(rotation) * (doc_mm * ppmm * zoom) + (tx, ty)',
+      samples: 'the drawn path: positions smoothed with an exponential filter (time constant smoothing_tau_ms); all other columns as reported by the device',
+      raw: 'present when smoothing_tau_ms > 0: the unsmoothed device samples, same columns; absent means samples are raw',
+      brush: 'technical (constant width), ink (width from pressure, mild), brush (width from pressure, strong); width_mm is the nominal width',
+      erased: '[[first_sample, last_sample, eraser_stroke_i], ...] parts of this stroke removed by later eraser strokes; the final drawing omits them',
       ppmm: 'CSS pixels per physical millimetre on this device at zoom 1 (from calibration)',
     },
     strokes: strokes.map(({ drawing, ...s }) => s),
@@ -622,7 +782,7 @@ async function exportJson(id) {
 async function previewPng(id) {
   const cur = S.meta && S.meta.id === id;
   const meta = cur ? S.meta : await DB.get('drawings', id);
-  const strokes = cur ? S.strokes : (await DB.strokes(id)).sort((a, b) => a.i - b.i);
+  const strokes = cur ? S.strokes : (await DB.strokes(id)).sort((a, b) => a.i - b.i).map(normalizeStroke);
   const W = meta.paper.w_mm, H = meta.paper.h_mm, K = Math.min(6, 2400 / Math.max(W, H));
   const c = document.createElement('canvas'); c.width = Math.round(W * K); c.height = Math.round(H * K);
   paintAll(c.getContext('2d'), strokes, W, H, K);
@@ -812,6 +972,8 @@ async function applyRemote(id, remote, md5, fileId) {
   const ls = cur ? S.strokes : (await DB.strokes(id)).sort((a, b) => a.i - b.i);
   const le = await DB.events(id);
   const { meta, strokes, events, renames } = mergeData(lm, ls, le, remote);
+  strokes.forEach(normalizeStroke);
+  computeErasure(strokes);
   meta.drive = { ...(lm.drive || {}), json: fileId, md5 };
   await DB.replaceDrawing(meta, strokes, events);
   if (S.meta && S.meta.id === id) {
@@ -827,7 +989,8 @@ async function importRemote(file) {
   const { strokes = [], events = [], sample_fields, units, exported, exported_by, ...m } = remote;
   if (!m.id || !m.paper) throw new Error('That file is not a Natural Hand drawing.');
   const meta = { ...m, format: FORMAT, rev: 0, synced_rev: 0, synced_at: file.modifiedTime, drive: { json: file.id, md5: file.md5Checksum }, view: null, stroke_count: strokes.length };
-  strokes.sort((a, b) => a.i - b.i).forEach((st) => { st.drawing = meta.id; });
+  strokes.sort((a, b) => a.i - b.i).forEach((st) => { st.drawing = meta.id; normalizeStroke(st); });
+  computeErasure(strokes);
   events.forEach((e) => { e.drawing = meta.id; });
   await DB.replaceDrawing(meta, strokes, events);
   return meta.id;
@@ -907,7 +1070,8 @@ const Diag = {
     if (e.tangentialPressure) this.seen.tangential = true;
   },
   end(st) {
-    const s = st.samples.filter((r, i) => i < st.samples.length - 1 || st.cancelled);
+    const src = st.raw || st.samples;
+    const s = src.filter((r, i) => i < src.length - 1 || st.cancelled);
     let pmin = Infinity, pmax = -Infinity;
     for (const r of s) { if (r[3] < pmin) pmin = r[3]; if (r[3] > pmax) pmax = r[3]; }
     if (!s.length) { pmin = pmax = 0; }
@@ -964,14 +1128,30 @@ function buildRail() {
   $('#fill-btn').innerHTML = ICONS.fill;
   $('#fit-btn').innerHTML = ICONS.fit;
   $('#menu-btn').innerHTML = ICONS.menu;
-  $('#nib-pop').innerHTML = NIBS.map((w, i) =>
-    `<button role="menuitemradio" data-w="${w}" title="${w} mm (${i + 1})"><i class="stroke" style="height:${nibThick(w)}px"></i><small>${w}</small></button>`).join('');
+  buildNibs();
 }
+function buildNibs() {
+  const list = S.tool === 'eraser' ? ERASERS : NIBS;
+  $('#nib-list').innerHTML = list.map((w, i) =>
+    `<button role="menuitemradio" data-w="${w}" title="${w} mm (${i + 1})"><i class="stroke" style="height:${Math.min(16, nibThick(w))}px"></i><small>${w}</small></button>`).join('');
+  $('#nib-title').textContent = S.tool === 'eraser' ? 'Eraser width, mm' : 'Width, mm';
+}
+const BRUSH_ICON = {
+  technical: '<line x1="5" y1="10" x2="19" y2="10" stroke="currentColor" stroke-linecap="round" stroke-width="W"/>',
+  ink: '<path d="M4 11 C8 9.6 14 9.2 20 10 C14 11 8 11.4 4 11Z" fill="currentColor" stroke="currentColor" stroke-width="W" stroke-linejoin="round"/>',
+  brush: '<path d="M3 13 C7 6 13 6 21 9 C14 9.5 9 11 3 13Z" fill="currentColor"/>',
+};
 function updateTools() {
-  const nb = $('#nib-btn');
-  nb.innerHTML = `<svg viewBox="0 0 24 24"><line x1="5" y1="10" x2="19" y2="10" stroke="currentColor" stroke-linecap="round" stroke-width="${Math.min(7, nibThick(S.width) / 1.6 + 0.6)}"/></svg><span>${S.width}</span>`;
-  nb.setAttribute('aria-label', `Pen width ${S.width} mm`);
-  for (const b of document.querySelectorAll('#nib-pop button')) b.setAttribute('aria-pressed', String(Number(b.dataset.w) === S.width));
+  const nb = $('#nib-btn'), er = S.tool === 'eraser', w = er ? S.eraserWidth : S.width;
+  const sw = Math.min(7, nibThick(w) / 1.6 + 0.6);
+  const glyph = er ? `<line x1="5" y1="10" x2="19" y2="10" stroke="currentColor" stroke-linecap="round" stroke-dasharray="2 3" stroke-width="${sw}"/>`
+    : BRUSH_ICON[S.brush].replace('W', S.brush === 'technical' ? sw : Math.max(0.5, sw / 3));
+  nb.innerHTML = `<svg viewBox="0 0 24 24">${glyph}</svg><span>${w}</span>`;
+  for (const b of document.querySelectorAll('#brush-seg button')) b.setAttribute('aria-pressed', String(!er && b.dataset.b === S.brush));
+  nb.setAttribute('aria-label', `${er ? 'Eraser' : 'Pen'} width ${w} mm, smoothing ${S.smoothing}`);
+  for (const b of document.querySelectorAll('#nib-list button')) b.setAttribute('aria-pressed', String(Number(b.dataset.w) === w));
+  $('#smooth-range').value = S.smoothing;
+  $('#smooth-val').textContent = S.smoothing;
   $('#eraser-btn').setAttribute('aria-pressed', String(S.tool === 'eraser'));
   $('#figure-btn').setAttribute('aria-pressed', String(S.figure != null));
   $('#fig-badge').textContent = S.figure != null ? S.figure : '';
@@ -1147,7 +1327,9 @@ function bindUI() {
   }, { passive: false });
 
   $('#nib-btn').onclick = () => ($('#nib-pop').hidden ? showNibs() : hideNibs());
-  $('#nib-pop').onclick = (e) => { const b = e.target.closest('button'); if (b) { setNib(Number(b.dataset.w)); hideNibs(); } };
+  $('#nib-list').onclick = (e) => { const b = e.target.closest('button'); if (b) { setNib(Number(b.dataset.w)); hideNibs(); } };
+  $('#smooth-range').oninput = (e) => setSmoothing(Number(e.target.value));
+  $('#brush-seg').onclick = (e) => { const b = e.target.closest('button'); if (b) setBrush(b.dataset.b); };
   $('#eraser-btn').onclick = toggleEraser;
   $('#undo-btn').onclick = undo;
   $('#redo-btn').onclick = redo;
@@ -1199,7 +1381,10 @@ function bindUI() {
     else if (mod && k === 'y') { e.preventDefault(); redo(); }
     else if (mod) return;
     else if (k === ' ') { spaceDown = true; view.style.cursor = 'grab'; e.preventDefault(); }
-    else if (k >= '1' && k <= '7') setNib(NIBS[Number(k) - 1]);
+    else if (k >= '1' && k <= '7') { const list = S.tool === 'eraser' ? ERASERS : NIBS; const w = list[Number(k) - 1]; if (w != null) setNib(w); }
+    else if (k === 'b') { const ks = Object.keys(BRUSHES); setBrush(ks[(ks.indexOf(S.brush) + 1) % ks.length]); }
+    else if (k === '[') setSmoothing(S.smoothing - 10);
+    else if (k === ']') setSmoothing(S.smoothing + 10);
     else if (k === 'e') toggleEraser();
     else if (k === 'f') toggleFigure();
     else if (k === 'g') toggleFill();
@@ -1225,6 +1410,9 @@ async function init() {
   resize();
   buildRail();
   S.width = NIBS.includes(Number(localStorage.getItem('nh-nib'))) ? Number(localStorage.getItem('nh-nib')) : 0.3;
+  S.eraserWidth = ERASERS.includes(Number(localStorage.getItem('nh-eraser'))) ? Number(localStorage.getItem('nh-eraser')) : 2;
+  S.smoothing = clamp(Number(localStorage.getItem('nh-smooth')) || 0, 0, 100);
+  S.brush = BRUSHES[localStorage.getItem('nh-brush')] ? localStorage.getItem('nh-brush') : 'technical';
   bindUI();
   updateTools();
   setDiag(S.diag);
