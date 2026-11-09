@@ -8,7 +8,7 @@
 'use strict';
 (() => {
 
-const APP_VERSION = '0.1.1';
+const APP_VERSION = '0.2.0';
 const FORMAT = 'natural-hand/1';
 const SAMPLE_FIELDS = ['dt_ms','x_mm','y_mm','pressure','tiltX','tiltY','twist','altitude','azimuth','tangential','width_px','height_px','buttons'];
 const PAPERS = { A5:[148,210], A4:[210,297], A3:[297,420] };
@@ -64,6 +64,21 @@ const DB = {
   all(store) { return this.read(store, (s) => s.getAll()); },
   strokes(id) { return this.read('strokes', (s) => s.getAll(IDBKeyRange.bound([id, 0], [id, Infinity]))); },
   events(id) { return this.read('events', (s) => s.index('drawing').getAll(id)); },
+  replaceDrawing(meta, strokes, events) {
+    const id = meta.id;
+    return this.write(['drawings', 'strokes', 'events'], (tx) => {
+      tx.objectStore('drawings').put(meta);
+      const ss = tx.objectStore('strokes');
+      ss.delete(IDBKeyRange.bound([id, 0], [id, Infinity]));
+      for (const st of strokes) ss.put(st);
+      const es = tx.objectStore('events');
+      es.index('drawing').openKeyCursor(IDBKeyRange.only(id)).onsuccess = (e) => {
+        const c = e.target.result;
+        if (c) { es.delete(c.primaryKey); c.continue(); }
+        else for (const ev of events) es.add(ev);
+      };
+    });
+  },
   deleteDrawing(id) {
     return this.write(['drawings', 'strokes', 'events'], (tx) => {
       tx.objectStore('drawings').delete(id);
@@ -558,6 +573,14 @@ async function openDrawing(id) {
   if (meta.view) S.view = { ...meta.view }; else fit();
   updateTools(); setSaveState('Saved'); updateDriveChip();
   requestRender();
+  if (Drive.ready() && navigator.onLine) pullCurrent();
+}
+async function pullCurrent() {
+  if (syncing || !S.meta) return;
+  syncing = true; updateDriveChip();
+  try { await syncOne(S.meta.id); lastSync = new Date(); syncError = null; }
+  catch (err) { syncError = err.message; }
+  finally { syncing = false; updateDriveChip(); }
 }
 function defaultPaper() { return Math.min(screen.width, screen.height) < 600 ? 'A5' : 'A4'; }
 
@@ -677,35 +700,164 @@ const Drive = {
     localStorage.setItem('nh-drive-folder', id);
     return id;
   },
-  async put(name, blob, fileId, folder) {
+  // upload (create or overwrite); returns {id, md5Checksum}
+  async put(name, blob, fileId, folder, props) {
     const send = (fid) => {
       const form = new FormData();
-      form.append('metadata', new Blob([JSON.stringify(fid ? { name } : { name, parents: [folder] })], { type: 'application/json' }));
+      const meta = fid ? { name } : { name, parents: [folder] };
+      if (props) meta.appProperties = props;
+      form.append('metadata', new Blob([JSON.stringify(meta)], { type: 'application/json' }));
       form.append('file', blob);
       const url = fid
-        ? `https://www.googleapis.com/upload/drive/v3/files/${fid}?uploadType=multipart&fields=id`
-        : 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id';
+        ? `https://www.googleapis.com/upload/drive/v3/files/${fid}?uploadType=multipart&fields=id,md5Checksum`
+        : 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,md5Checksum';
       return this.api(url, { method: fid ? 'PATCH' : 'POST', body: form });
     };
+    if (!fileId) fileId = await this.findByName(name, folder);
     if (fileId) {
-      try { return (await send(fileId)).id; }
+      try { return await send(fileId); }
       catch (e) { if (e.status !== 404) throw e; }
     }
-    return (await send(null)).id;
+    return send(null);
+  },
+  async findByName(name, folder) {
+    const q = encodeURIComponent(`name='${name.replace(/'/g, "\\'")}' and '${folder}' in parents and trashed=false`);
+    const l = await this.api(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id)&spaces=drive`);
+    return l.files && l.files.length ? l.files[0].id : null;
+  },
+  async stat(fileId) {
+    try { return await this.api(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,md5Checksum,modifiedTime,trashed`); }
+    catch (e) { if (e.status === 404) return null; throw e; }
+  },
+  async list(folder) {
+    const q = encodeURIComponent(`'${folder}' in parents and trashed=false and name contains '.json.gz'`);
+    const l = await this.api(`https://www.googleapis.com/drive/v3/files?q=${q}&pageSize=1000&orderBy=modifiedTime desc&fields=files(id,name,modifiedTime,md5Checksum,size,appProperties)&spaces=drive`);
+    return l.files || [];
+  },
+  async download(fileId) {
+    const r = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, { headers: { Authorization: 'Bearer ' + this.token } });
+    if (r.status === 401) { this.token = null; localStorage.removeItem('nh-drive-token'); const e = new Error('Drive sign-in expired. Tap the Drive button to reconnect.'); e.status = 401; throw e; }
+    if (!r.ok) { const e = new Error(`Drive download failed (${r.status})`); e.status = r.status; throw e; }
+    const buf = await r.arrayBuffer();
+    const b = new Uint8Array(buf);
+    const isGz = b[0] === 0x1f && b[1] === 0x8b;
+    const text = isGz ? await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).text() : new TextDecoder().decode(buf);
+    return JSON.parse(text);
   },
 };
 
+/* ------------------------------------------------------------ cross-device merge
+ * Each stroke is identified by (session, t0), which is unique across devices.
+ * Merging takes the union of both copies, orders strokes by time and renumbers them.
+ * For a stroke present in both, the copy from the more recently updated side wins
+ * (that is where an undo or redo would have happened). */
+const strokeKey = (s) => `${s.session}|${s.t0}`;
+const eventKey = (e) => `${e.session}|${e.t}|${e.type}|${e.stroke ?? ''}|${e.figure ?? ''}`;
+function mergeData(lm, ls, le, remote) {
+  const id = lm.id;
+  const remoteNewer = (remote.updated || '') > (lm.updated || '');
+  const map = new Map();
+  for (const st of ls) map.set(strokeKey(st), st);
+  for (const st of remote.strokes || []) {
+    const k = strokeKey(st);
+    if (!map.has(k) || remoteNewer) map.set(k, { ...st });
+  }
+  const strokes = [...map.values()].sort((a, b) => a.t0 - b.t0);
+  const emap = new Map();
+  for (const e of le) emap.set(eventKey(e), e);
+  for (const e of remote.events || []) if (!emap.has(eventKey(e))) emap.set(eventKey(e), { ...e });
+  const events = [...emap.values()].sort((a, b) => a.t - b.t);
+  // undo/redo events point at stroke numbers; translate them to stroke identities first
+  const oldIndex = (src) => new Map(src.map((st) => [st.i, strokeKey(st)]));
+  const localIdx = oldIndex(ls), remoteIdx = oldIndex(remote.strokes || []);
+  const localEv = new Set(le.map(eventKey));
+  for (const e of events) {
+    if (e.stroke == null) continue;
+    e._sk = (localEv.has(eventKey(e)) ? localIdx : remoteIdx).get(e.stroke);
+  }
+  strokes.forEach((st, i) => { st.i = i; st.drawing = id; });
+  const newIndex = new Map(strokes.map((st) => [strokeKey(st), st.i]));
+  for (const e of events) { if (e._sk) { e.stroke = newIndex.get(e._sk) ?? e.stroke; delete e._sk; } e.drawing = id; }
+  // figure numbers started independently on two devices can collide: renumber the later one
+  const starts = new Map();
+  for (const e of events) if (e.type === 'figure_start') {
+    if (!starts.has(e.figure)) starts.set(e.figure, []);
+    starts.get(e.figure).push(e.session);
+  }
+  let maxFig = 0;
+  for (const st of strokes) if (typeof st.figure === 'number') maxFig = Math.max(maxFig, st.figure);
+  for (const e of events) if (typeof e.figure === 'number') maxFig = Math.max(maxFig, e.figure);
+  const renames = new Map();
+  for (const [fig, sessions] of starts) for (const sess of [...new Set(sessions)].slice(1)) renames.set(`${sess}|${fig}`, ++maxFig);
+  for (const st of strokes) { const r = renames.get(`${st.session}|${st.figure}`); if (r) st.figure = r; }
+  for (const e of events) { const r = renames.get(`${e.session}|${e.figure}`); if (r) e.figure = r; }
+  const sessions = [...(lm.sessions || [])];
+  for (const ss of remote.sessions || []) if (!sessions.some((x) => x.id === ss.id)) sessions.push(ss);
+  sessions.sort((a, b) => (a.started || '').localeCompare(b.started || ''));
+  const newer = remoteNewer ? remote : lm;
+  const meta = {
+    ...lm,
+    title: newer.title || '', tags: newer.tags || [], notes: newer.notes || '',
+    updated: remoteNewer ? remote.updated : lm.updated,
+    sessions, figure_count: Math.max(maxFig, lm.figure_count || 0, remote.figure_count || 0),
+    stroke_count: strokes.length,
+  };
+  return { meta, strokes, events, renames };
+}
+async function waitIdle() { while (S.active) await new Promise((r) => setTimeout(r, 200)); }
+async function applyRemote(id, remote, md5, fileId) {
+  if (S.meta && S.meta.id === id) await waitIdle();
+  const cur = S.meta && S.meta.id === id;
+  const lm = cur ? S.meta : await DB.get('drawings', id);
+  const ls = cur ? S.strokes : (await DB.strokes(id)).sort((a, b) => a.i - b.i);
+  const le = await DB.events(id);
+  const { meta, strokes, events, renames } = mergeData(lm, ls, le, remote);
+  meta.drive = { ...(lm.drive || {}), json: fileId, md5 };
+  await DB.replaceDrawing(meta, strokes, events);
+  if (S.meta && S.meta.id === id) {
+    const added = strokes.length - S.strokes.length;
+    S.meta = meta; S.strokes = strokes; S.redo = [];
+    if (S.figure != null) S.figure = renames.get(`${S.sessionId}|${S.figure}`) || S.figure;
+    repaint(); updateTools();
+    if (added > 0) toast(`Pulled ${added} stroke${added === 1 ? '' : 's'} from your other device.`);
+  }
+}
+async function importRemote(file) {
+  const remote = await Drive.download(file.id);
+  const { strokes = [], events = [], sample_fields, units, exported, exported_by, ...m } = remote;
+  if (!m.id || !m.paper) throw new Error('That file is not a Natural Hand drawing.');
+  const meta = { ...m, format: FORMAT, rev: 0, synced_rev: 0, synced_at: file.modifiedTime, drive: { json: file.id, md5: file.md5Checksum }, view: null, stroke_count: strokes.length };
+  strokes.sort((a, b) => a.i - b.i).forEach((st) => { st.drawing = meta.id; });
+  events.forEach((e) => { e.drawing = meta.id; });
+  await DB.replaceDrawing(meta, strokes, events);
+  return meta.id;
+}
+
 let syncing = false, lastSync = null, syncError = null;
 async function syncOne(id) {
-  const cur = S.meta && S.meta.id === id;
-  const meta = cur ? S.meta : await DB.get('drawings', id);
-  const rev = meta.rev || 0;
-  const json = JSON.stringify(await buildExport(id));
-  const gz = await gzip(json);
+  const getMeta = async () => (S.meta && S.meta.id === id ? S.meta : DB.get('drawings', id));
+  let meta = await getMeta();
+  if (!meta) return;
   const folder = await Drive.folder();
+  // 1. pull: if the Drive copy changed since this device last saw it, merge it in
+  const fileId = (meta.drive && meta.drive.json) || await Drive.findByName(`${id}.json.gz`, folder);
+  if (fileId) {
+    const st = await Drive.stat(fileId);
+    if (st && !st.trashed && st.md5Checksum !== (meta.drive && meta.drive.md5)) {
+      await applyRemote(id, await Drive.download(fileId), st.md5Checksum, fileId);
+      meta = await getMeta();
+    }
+  }
+  // 2. push: upload if this device has changes Drive does not
+  if ((meta.rev || 0) <= (meta.synced_rev || 0) && meta.drive && meta.drive.json) return;
+  if (S.meta && S.meta.id === id) await waitIdle();
+  const rev = meta.rev || 0;
+  const gz = await gzip(JSON.stringify(await buildExport(id)));
   meta.drive = meta.drive || {};
-  meta.drive.json = await Drive.put(`${id}.json.gz`, gz, meta.drive.json, folder);
-  meta.drive.png = await Drive.put(`${id}.png`, await previewPng(id), meta.drive.png, folder);
+  const props = { title: (meta.title || '').slice(0, 60), strokes: String(meta.stroke_count || 0), paper: meta.paper.name };
+  const up = await Drive.put(`${id}.json.gz`, gz, meta.drive.json, folder, props);
+  meta.drive.json = up.id; meta.drive.md5 = up.md5Checksum;
+  meta.drive.png = (await Drive.put(`${id}.png`, await previewPng(id), meta.drive.png, folder)).id;
   meta.synced_rev = rev;
   meta.synced_at = new Date().toISOString();
   await DB.put('drawings', meta);
@@ -717,7 +869,7 @@ async function syncAll(manual) {
   try {
     if (S.meta) await flushMeta();
     const metas = await DB.all('drawings');
-    for (const m of metas) if ((m.rev || 0) > (m.synced_rev || 0)) await syncOne(m.id);
+    for (const m of metas) if ((S.meta && m.id === S.meta.id) || (m.rev || 0) > (m.synced_rev || 0)) await syncOne(m.id);
     lastSync = new Date();
     if (manual) toast('Everything is in Google Drive.');
   } catch (err) {
@@ -907,7 +1059,7 @@ async function openList() {
     el.querySelector('[data-a=open]').onclick = async () => { $('#list-dlg').close(); $('#menu').close(); await openDrawing(m.id); };
     el.querySelector('[data-a=json]').onclick = () => exportJson(m.id);
     el.querySelector('[data-a=del]').onclick = async () => {
-      if (!confirm(`Delete "${m.title || m.id}" from this device? This cannot be undone here. A copy in Google Drive, if any, stays.`)) return;
+      if (!confirm(`Delete "${m.title || m.id}" from this device? A copy in Google Drive, if synced, stays and can be opened again.`)) return;
       await DB.deleteDrawing(m.id);
       if (S.meta && S.meta.id === m.id) { S.meta = null; S.paper = null; S.strokes = []; localStorage.removeItem('nh-last'); requestRender(); }
       openList();
@@ -915,6 +1067,40 @@ async function openList() {
     list.appendChild(el);
   }
   if (!$('#list-dlg').open) $('#list-dlg').showModal();
+  listRemote(new Set(metas.map((m) => m.id)));
+}
+async function listRemote(localIds) {
+  const box = $('#remote-list'), txt = $('#remote-text');
+  box.innerHTML = '';
+  if (!Drive.ready()) {
+    txt.textContent = 'Connect Google Drive to see drawings from your other devices.';
+    $('#remote-connect').hidden = false;
+    return;
+  }
+  $('#remote-connect').hidden = true;
+  txt.textContent = 'Looking in Google Drive…';
+  try {
+    const files = (await Drive.list(await Drive.folder())).filter((f) => !localIds.has(f.name.replace(/\.json\.gz$/, '')));
+    txt.textContent = files.length ? 'These are in Drive but not on this device yet.' : 'Every drawing in Drive is already on this device.';
+    for (const f of files) {
+      const id = f.name.replace(/\.json\.gz$/, ''), p = f.appProperties || {};
+      const el = document.createElement('div');
+      el.className = 'item';
+      const when = new Date(f.modifiedTime);
+      el.innerHTML = `<div class="ph"></div><div><div class="name"></div><div class="meta"></div></div><div class="acts"><button class="btn primary" data-a="get">Open</button></div>`;
+      el.querySelector('.name').textContent = p.title || id;
+      el.querySelector('.meta').textContent = `${p.paper ? p.paper + ', ' : ''}${p.strokes ? p.strokes + ' strokes, ' : ''}changed ${when.toLocaleDateString()} ${pad2(when.getHours())}:${pad2(when.getMinutes())}`;
+      el.querySelector('[data-a=get]').onclick = async (ev) => {
+        ev.target.disabled = true; ev.target.textContent = 'Getting…';
+        try {
+          const newId = await importRemote(f);
+          $('#list-dlg').close(); $('#menu').close();
+          await openDrawing(newId);
+        } catch (err) { toast(err.message); ev.target.disabled = false; ev.target.textContent = 'Open'; }
+      };
+      box.appendChild(el);
+    }
+  } catch (err) { txt.textContent = err.message; }
 }
 
 /* calibration */
@@ -984,6 +1170,7 @@ function bindUI() {
   $('#m-drive-sync').onclick = () => syncAll(true);
   $('#m-calib').onclick = () => openCalib();
   $('#list-close').onclick = () => $('#list-dlg').close();
+  $('#remote-connect').onclick = async () => { if (await connectDrive()) openList(); };
   $('#n-cancel').onclick = () => $('#new-dlg').close();
   $('#n-create').onclick = async () => {
     $('#new-dlg').close(); $('#menu').close();
@@ -1057,7 +1244,7 @@ async function init() {
 }
 
 // test hook (used by automated checks; harmless in normal use)
-window.__nh = { S, buildExport, undo, redo, toggleFigure, fit };
+window.__nh = { S, buildExport, undo, redo, toggleFigure, fit, Drive, syncAll, mergeData };
 
 init();
 })();
