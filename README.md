@@ -68,6 +68,7 @@ Then open the menu, turn on **Show live pen data**, and draw a few lines. The pa
 | Replay | menu, Replay | R, then Space to pause, Esc to close |
 | Label parts afterwards | Replay, Label parts | |
 | See, rename or remove parts | menu, Parts (or Parts in replay labelling) | |
+| Your hand: how you draw, measured from this drawing | menu, Your hand | |
 | Replay video | menu, Export video | |
 | Live pen data | menu | D |
 
@@ -152,7 +153,7 @@ python tools/health.py path/to/folder
 
 It prints a summary per device and writes `health.html` next to the drawings. The report covers the real sample rate and gaps (dropped samples), whether pressure tops out, whether tilt and hover are reported, and calibration, each marked OK, Check or Info with what to do. It also has histograms of sample timing, pressure, speed and tilt.
 
-`tools/hand.py` describes how you draw, from the movement in one drawing or a whole folder of them:
+**Your hand** in the menu shows the same report inside the app for the drawing that is open, worked out on the device (with a progress bar on big drawings, and nothing is sent anywhere). `tools/hand.py` makes it on a computer for one drawing or a whole folder of them:
 
 ```
 python tools/hand.py path/to/folder

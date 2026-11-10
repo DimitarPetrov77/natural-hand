@@ -158,7 +158,7 @@ def analyse(files):
                     ln.travel = float(math.hypot(*(xy[0] - prev[1])))
                 lines.append(ln)
                 sh.timeline.append((st.t0, WHITE if white else FILL if ln.fill else ln.cls, end))
-                sh.pen_min += dur / 60000
+                sh.pen_min += (end - st.t0) / 60000   # pen down to pen up
             if len(raw):
                 prev = (end, raw[-1, 1:3])
         # pictures: the drawn (smoothed) path as it ended up on the page, erased parts removed

@@ -8,7 +8,7 @@
 'use strict';
 (() => {
 
-const APP_VERSION = '0.8.0';
+const APP_VERSION = '0.9.0';
 const FORMAT = 'natural-hand/1';
 const SAMPLE_FIELDS = ['dt_ms','x_mm','y_mm','pressure','tiltX','tiltY','twist','altitude','azimuth','tangential','width_px','height_px','buttons'];
 const PAPERS = { A5: [148, 210], A4: [210, 297], A3: [297, 420], A2: [420, 594], A1: [594, 841], Square: [300, 300] };
@@ -2314,6 +2314,435 @@ const Diag = {
 Diag.reset();
 function setDiag(on) { S.diag = on; localStorage.setItem('nh-diag', on ? '1' : '0'); Diag.el.hidden = !on; if (on) Diag.show(true); }
 
+/* ------------------------------------------------------------ your hand (report)
+ * How you draw, measured from the movement in the open drawing: the same report as
+ * tools/hand.py, worked out here in slices so the page never freezes. Statistics use
+ * the device samples (raw), finished ink lines only; fill lines are left out and white
+ * marks (white pen, cut-through eraser) have their own section. */
+const HAND_CLASSES = [
+  ['Dots', 0, 0.3, 'under 0.3 mm: stipple, touches'],
+  ['Ticks', 0.3, 1.5, '0.3 to 1.5 mm: fringe hairs, short hatching'],
+  ['Short lines', 1.5, 6, '1.5 to 6 mm: hatching, small contours'],
+  ['Long lines', 6, Infinity, 'over 6 mm: contours, construction'],
+];
+const H_FILL = 4, H_WHITE = 5, H_BREAK = 60000, H_SPEED_MS = 10;
+const hMed = (a) => {
+  const v = a.filter((x) => x != null && Number.isFinite(x)).sort((x, y) => x - y), n = v.length;
+  return n ? (n % 2 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2) : NaN;
+};
+const hPctl = (a, q) => { const v = a.filter(Number.isFinite).sort((x, y) => x - y); return v.length ? v[Math.min(v.length - 1, Math.floor(q * v.length))] : NaN; };
+function hG(x, unit = '', nd = 3) {
+  if (x == null || !Number.isFinite(x)) return '–';
+  const s = Math.abs(x) < 10 ** nd ? String(Number(x.toPrecision(nd))) : Math.round(x).toLocaleString('en');
+  return (s + ' ' + unit).trim();
+}
+const hPct = (n, of) => (of ? `${Math.round((100 * n) / of)}%` : '–');
+const hCls = (len) => { for (let k = 0; k < HAND_CLASSES.length; k++) if (len >= HAND_CLASSES[k][1] && len < HAND_CLASSES[k][2]) return k; return HAND_CLASSES.length - 1; };
+function hRand(seed) { let a = seed >>> 0; return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+function hSample(list, n, seed) { const r = hRand(seed), a = list.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a.slice(0, n); }
+
+async function handAnalyse(strokes, meta, events, onProgress) {
+  const order = strokes.filter((s) => s.samples.length).sort((a, b) => a.t0 - b.t0);
+  const devOf = new Map((meta.sessions || []).map((s) => [s.id, (s.device && s.device.name) || '?']));
+  const parts = meta.parts || {};
+  const lines = [], timeline = [], rates = new Map(), devices = new Set();
+  let prev = null, cancelled = 0, white = 0, penMs = 0, end = performance.now() + 12;
+  for (let k = 0; k < order.length; k++) {
+    const st = order[k], src = st.raw || st.samples, raw = st.cancelled ? src : src.slice(0, -1);
+    const endT = st.t0 + src[src.length - 1][0], isWhite = st.tool === 'eraser' || st.ink === 'white';
+    if (st.cancelled) cancelled++;
+    if (!st.undone_at && !st.cancelled && raw.length) {
+      const dev = devOf.get(st.session) || '?', n = raw.length, cum = new Float64Array(n);
+      devices.add(dev);
+      for (let i = 1; i < n; i++) cum[i] = cum[i - 1] + Math.hypot(raw[i][1] - raw[i - 1][1], raw[i][2] - raw[i - 1][2]);
+      const length = cum[n - 1], dur = n > 1 ? raw[n - 1][0] - raw[0][0] : 0;
+      if (!rates.has(dev)) rates.set(dev, []);
+      const rl = rates.get(dev);
+      for (let i = 1; i < n; i++) { const d = raw[i][0] - raw[i - 1][0]; if (d > 0) rl.push(d); }
+      let peak = 0, any = false;
+      for (let i = 0, j = 0; i < n; i++) { // speed over at least 10 ms, so pen jitter is not movement
+        if (j < i) j = i;
+        while (j < n && raw[j][0] < raw[i][0] + H_SPEED_MS) j++;
+        if (j >= n) break;
+        const v = ((cum[j] - cum[i]) / (raw[j][0] - raw[i][0])) * 1000;
+        any = true; if (v > peak) peak = v;
+      }
+      if (!any) peak = n > 1 && dur > 0 ? (length / dur) * 1000 : 0;
+      const pr = raw.map((r) => r[3]).filter((x) => x != null);
+      let profile = null;
+      if (n >= 8 && dur > 0) {
+        profile = new Float64Array(50);
+        for (let q = 0, i = 0; q < 50; q++) {
+          const u = q / 49;
+          while (i < n - 2 && (raw[i + 1][0] - raw[0][0]) / dur < u) i++;
+          const u0 = (raw[i][0] - raw[0][0]) / dur, u1 = (raw[i + 1][0] - raw[0][0]) / dur, f = u1 > u0 ? clamp((u - u0) / (u1 - u0), 0, 1) : 0;
+          profile[q] = (raw[i][3] || 0) + ((raw[i + 1][3] || 0) - (raw[i][3] || 0)) * f;
+        }
+      }
+      const dx = raw[n - 1][1] - raw[0][1], dy = raw[n - 1][2] - raw[0][2];
+      const alts = raw.map((r) => r[7]).filter((x) => x != null && Number.isFinite(x));
+      const ln = {
+        i: st.i, st, t0: st.t0, t1: endT, n, length, peak, chord: Math.hypot(dx, dy),
+        dur: endT - st.t0, // pen down to pen up
+        angle: (((Math.atan2(dy, dx) * 180) / Math.PI) % 360 + 360) % 360,
+        pressure: pr.length ? hMed(pr) : NaN, width: st.width_mm, device: dev,
+        kinds: isWhite ? [] : [...new Set((st.parts || []).filter((id) => parts[id] && !parts[id].removed_at).map((id) => parts[id].kind))],
+        fill: !isWhite && (st.tags || []).includes('fill'), white: isWhite,
+        tilt: hMed(raw.filter((r) => r[4] != null).map((r) => Math.hypot(r[4], r[5] || 0))), altitude: alts.length ? (hMed(alts) * 180) / Math.PI : NaN,
+        profile, pause: prev ? st.t0 - prev[0] : null, travel: prev ? Math.hypot(raw[0][1] - prev[1], raw[0][2] - prev[2]) : null,
+        cls: hCls(length),
+      };
+      if (isWhite) white++;
+      lines.push(ln);
+      timeline.push([st.t0, isWhite ? H_WHITE : ln.fill ? H_FILL : ln.cls, endT]);
+      penMs += endT - st.t0;
+    }
+    if (raw.length) prev = [endT, raw[raw.length - 1][1], raw[raw.length - 1][2]];
+    if (performance.now() > end) { if (onProgress) onProgress(k / order.length); await yieldNow(); end = performance.now() + 12; }
+  }
+  return {
+    lines, timeline, rates, devices, cancelled, white, undo: events.filter((e) => e.type === 'undo').length,
+    penMin: penMs / 60000, spanMin: timeline.length ? (timeline[timeline.length - 1][2] - timeline[0][0]) / 60000 : 0,
+  };
+}
+
+// ---- charts (inline SVG strings)
+const hEsc = (t) => String(t).replace(/[<&>"]/g, (c) => ({ '<': '&lt;', '&': '&amp;', '>': '&gt;', '"': '&quot;' }[c]));
+function hTicksLog(lo, hi) { const o = []; for (let e = Math.floor(Math.log10(lo)); e <= Math.ceil(Math.log10(hi)); e++) for (const m of [1, 3]) { const v = m * 10 ** e; if (v >= lo && v <= hi) o.push(Number(v.toPrecision(3))); } return o; }
+function hTicksLin(lo, hi, n = 5) {
+  const span = hi - lo; let step = span > 0 ? 10 ** Math.floor(Math.log10(span / n)) : 1;
+  for (const m of [1, 2, 5, 10]) if (span / (step * m) <= n) { step *= m; break; }
+  const o = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) o.push(Number(v.toPrecision(10)));
+  return o;
+}
+const hTick = (v) => (v < 1000 ? String(v) : `${v / 1000}k`);
+const hFig = (cap, body, note = '') => `<figure><figcaption>${cap}</figcaption>${body}${note ? `<p class="note">${note}</p>` : ''}</figure>`;
+function hHist(values, lo, hi, { bins = 36, log = false, unit = '', caption = '', what = 'lines' } = {}) {
+  let v = values.filter((x) => x != null && Number.isFinite(x));
+  if (log) v = v.filter((x) => x > 0);
+  if (!v.length) return '';
+  const tr = log ? Math.log10 : (x) => x, inv = log ? (x) => 10 ** x : (x) => x, a = tr(lo), b = tr(hi);
+  const counts = new Array(bins).fill(0);
+  for (const x of v) counts[Math.min(bins - 1, Math.max(0, Math.floor(((clamp(tr(x), a, b) - a) / (b - a)) * bins)))]++;
+  const W = 420, H = 120, T = 14, B = 20, bw = W / bins, top = Math.max(...counts) || 1, X = (val) => ((tr(val) - a) / (b - a)) * W;
+  const vmax = Math.max(...v), vmin = Math.min(...v), out = [`<line class="base" x1="0" y1="${T + H + 0.5}" x2="${W}" y2="${T + H + 0.5}"/>`];
+  counts.forEach((c, k) => {
+    const h = (c / top) * H, l = inv(a + ((b - a) * k) / bins), r = inv(a + ((b - a) * (k + 1)) / bins);
+    if (c) out.push(`<rect class="bar" x="${(k * bw + 1).toFixed(1)}" y="${(T + H - h).toFixed(1)}" width="${Math.max(bw - 2, 1).toFixed(1)}" height="${h.toFixed(1)}" rx="1.5"/>`);
+    const more = k === bins - 1 && vmax >= hi ? ' and above' : k === 0 && vmin <= lo ? ' and below' : '';
+    out.push(`<rect class="hit" x="${(k * bw).toFixed(1)}" y="${T}" width="${bw.toFixed(1)}" height="${H}" data-tip="${hEsc(`${hG(l)}–${hG(r)} ${unit}${more}: ${c.toLocaleString('en')} ${what} (${hPct(c, v.length)})`)}"/>`);
+  });
+  for (const t of log ? hTicksLog(lo, hi) : hTicksLin(lo, hi)) {
+    const x = X(t), an = x < 8 ? 'start' : x > W - 8 ? 'end' : 'middle';
+    out.push(`<line class="tick" x1="${x.toFixed(1)}" y1="${T + H}" x2="${x.toFixed(1)}" y2="${T + H + 4}"/><text x="${x.toFixed(1)}" y="${T + H + 16}" text-anchor="${an}">${hTick(t)}</text>`);
+  }
+  const m = hMed(v), x = clamp(X(clamp(m, lo, hi)), 0, W), left = x < W * 0.7;
+  out.push(`<line class="med" x1="${x.toFixed(1)}" y1="${T - 2}" x2="${x.toFixed(1)}" y2="${T + H}"/><text class="medl" x="${(x + (left ? 4 : -4)).toFixed(1)}" y="${T + 8}" text-anchor="${left ? 'start' : 'end'}">median ${hG(m, unit)}</text>`);
+  return hFig(caption, `<svg viewBox="0 0 ${W} ${T + H + B}" role="img" aria-label="${hEsc(caption)}">${out.join('')}</svg>`);
+}
+function hScatter(lines) {
+  const pts = lines.filter((l) => l.length > 0.02 && l.peak > 0.05);
+  if (pts.length < 10) return '';
+  const xlo = 0.02, xhi = Math.max(30, hPctl(pts.map((l) => l.length), 0.998) * 1.2), ylo = 0.5, yhi = Math.max(50, hPctl(pts.map((l) => l.peak), 0.998) * 1.2);
+  const W = 420, H = 250, L = 34, B = 22, T = 8, lg = Math.log10;
+  const X = (v) => L + ((lg(clamp(v, xlo, xhi)) - lg(xlo)) / (lg(xhi) - lg(xlo))) * (W - L);
+  const Y = (v) => T + H - ((lg(clamp(v, ylo, yhi)) - lg(ylo)) / (lg(yhi) - lg(ylo))) * H;
+  const out = [];
+  for (const t of hTicksLog(ylo, yhi)) out.push(`<line class="grid" x1="${L}" y1="${Y(t).toFixed(1)}" x2="${W}" y2="${Y(t).toFixed(1)}"/><text x="${L - 5}" y="${(Y(t) + 4).toFixed(1)}" text-anchor="end">${hTick(t)}</text>`);
+  for (const t of hTicksLog(xlo, xhi)) out.push(`<text x="${X(t).toFixed(1)}" y="${T + H + 16}" text-anchor="middle">${hTick(t)}</text>`);
+  HAND_CLASSES.forEach(([name, lo, hi], k) => {
+    if (k) out.push(`<line class="bound" x1="${X(lo).toFixed(1)}" y1="${T}" x2="${X(lo).toFixed(1)}" y2="${T + H}"/>`);
+    out.push(`<text class="cl" x="${((X(Math.max(lo, xlo)) + X(Math.min(hi, xhi))) / 2).toFixed(1)}" y="${T + 10}" text-anchor="middle">${name}</text>`);
+  });
+  const sel = pts.length > 6000 ? hSample(pts, 6000, 1) : pts;
+  out.push('<g class="dots">' + sel.map((l) => `<circle cx="${X(l.length).toFixed(1)}" cy="${Y(l.peak).toFixed(1)}" r="1.6"/>`).join('') + '</g>');
+  const fitPts = pts.filter((l) => l.length > 0.3 && l.peak > 0.5);
+  let note = '';
+  if (fitPts.length > 20) { // least squares in log-log
+    const xs = fitPts.map((l) => lg(l.length)), ys = fitPts.map((l) => lg(l.peak)), mx = xs.reduce((s, x) => s + x, 0) / xs.length, my = ys.reduce((s, y) => s + y, 0) / ys.length;
+    let sxy = 0, sxx = 0; xs.forEach((x, i) => { sxy += (x - mx) * (ys[i] - my); sxx += (x - mx) ** 2; });
+    const bb = sxy / sxx, aa = 10 ** (my - bb * mx);
+    out.push(`<line class="fit" x1="${X(0.3).toFixed(1)}" y1="${Y(aa * 0.3 ** bb).toFixed(1)}" x2="${X(xhi).toFixed(1)}" y2="${Y(aa * xhi ** bb).toFixed(1)}" data-tip="${hEsc(`Fitted on lines over 0.3 mm: peak speed ≈ ${hG(aa)} × length^${bb.toFixed(2)}`)}"/>`);
+    note = `The dashed line: peak speed ≈ ${hG(aa)} × length<sup>${bb.toFixed(2)}</sup> (lines over 0.3 mm). An exponent below 1 means longer lines are faster, but not in proportion: they take longer too.`;
+  }
+  out.push(`<line class="base" x1="${L}" y1="${T + H + 0.5}" x2="${W}" y2="${T + H + 0.5}"/>`);
+  const cap = 'Peak speed against length, one dot per line (both scales logarithmic: mm and mm/s)';
+  return hFig(cap, `<svg viewBox="0 0 ${W} ${T + H + B}" role="img" aria-label="${hEsc(cap)}">${out.join('')}</svg>`, note);
+}
+function hProfiles(lines) {
+  const groups = [];
+  HAND_CLASSES.forEach(([name], k) => {
+    const ps = lines.filter((l) => l.cls === k && l.profile);
+    if (ps.length >= 15) groups.push([k, name, Array.from({ length: 50 }, (_, q) => hMed(ps.map((l) => l.profile[q]))), ps.length]);
+  });
+  if (!groups.length) return '';
+  const W = 420, H = 170, L = 30, B = 22, T = 10, R = 86, top = Math.max(0.2, Math.max(...groups.map((g) => Math.max(...g[2]))) * 1.1);
+  const X = (u) => L + u * (W - L - R), Y = (p) => T + H - (p / top) * H, out = [];
+  for (const t of hTicksLin(0, top, 4)) out.push(`<line class="grid" x1="${L}" y1="${Y(t).toFixed(1)}" x2="${W - R}" y2="${Y(t).toFixed(1)}"/><text x="${L - 5}" y="${(Y(t) + 4).toFixed(1)}" text-anchor="end">${t}</text>`);
+  for (const [u, lab] of [[0, 'pen down'], [0.5, 'middle'], [1, 'pen up']]) out.push(`<text x="${X(u).toFixed(1)}" y="${T + H + 16}" text-anchor="${u === 0 ? 'start' : u === 1 ? 'end' : 'middle'}">${lab}</text>`);
+  const ends = [];
+  for (const [k, name, prof, n] of groups) {
+    const d = prof.map((p, j) => `${X(j / 49).toFixed(1)},${Y(p).toFixed(1)}`).join(' ');
+    out.push(`<polyline class="ser s${k + 1}" points="${d}"/><polyline class="hitl" points="${d}" data-tip="${hEsc(`${name}: median pressure through the line, ${n.toLocaleString('en')} lines; peak ${Math.max(...prof).toFixed(2)}`)}"/>`);
+    ends.push([Y(prof[42]), name, k, Y(prof[42])]);
+  }
+  ends.sort((p, q) => p[0] - q[0]);
+  for (let j = 1; j < ends.length; j++) ends[j][0] = Math.max(ends[j][0], ends[j - 1][0] + 13);
+  const shift = Math.max(0, ends[ends.length - 1][0] - (T + H - 4));
+  for (const [y, name, k, y0] of ends) out.push(`<line class="lead s${k + 1}" x1="${(X(42 / 49) + 3).toFixed(1)}" y1="${y0.toFixed(1)}" x2="${(X(1) + 8).toFixed(1)}" y2="${(y - shift).toFixed(1)}"/><text class="lbl" x="${(X(1) + 11).toFixed(1)}" y="${(y - shift + 4).toFixed(1)}">${name}</text>`);
+  out.push(`<line class="base" x1="${L}" y1="${T + H + 0.5}" x2="${W - R}" y2="${T + H + 0.5}"/>`);
+  const legend = '<div class="legend">' + groups.map(([k, n]) => `<span><i class="sw s${k + 1}"></i>${n}</span>`).join('') + '</div>';
+  const cap = 'Pressure through a line, from pen down to pen up (median of each kind of mark)';
+  return hFig(cap, legend + `<svg viewBox="0 0 ${W} ${T + H + B}" role="img" aria-label="${hEsc(cap)}">${out.join('')}</svg>`);
+}
+function hRose(lines, caption) {
+  if (lines.length < 20) return '';
+  const nb = 24, counts = new Array(nb).fill(0);
+  for (const l of lines) counts[Math.floor(l.angle / (360 / nb)) % nb]++;
+  const top = Math.max(...counts) || 1, c = 120, R = 96, names = ['right', 'down-right', 'down', 'down-left', 'left', 'up-left', 'up', 'up-right'];
+  const out = [1 / 3, 2 / 3, 1].map((f) => `<circle class="ring" cx="${c}" cy="${c}" r="${R * f}"/>`);
+  const wedge = (r, a0, a1) => `M${c} ${c}L${(c + r * Math.cos(a0)).toFixed(1)} ${(c + r * Math.sin(a0)).toFixed(1)}A${r.toFixed(1)} ${r.toFixed(1)} 0 0 1 ${(c + r * Math.cos(a1)).toFixed(1)} ${(c + r * Math.sin(a1)).toFixed(1)}Z`;
+  counts.forEach((cnt, k) => {
+    const a0 = ((k * 360) / nb + 1) * (Math.PI / 180), a1 = (((k + 1) * 360) / nb - 1) * (Math.PI / 180), mid = ((k + 0.5) * 360) / nb;
+    if (cnt) out.push(`<path class="bar" d="${wedge(R * Math.sqrt(cnt / top), a0, a1)}"/>`);
+    out.push(`<path class="hit" d="${wedge(R, a0, a1)}" data-tip="${hEsc(`Toward ${k * 15}–${(k + 1) * 15}° (${names[Math.floor(((mid + 22.5) % 360) / 45)]}): ${cnt.toLocaleString('en')} lines (${hPct(cnt, lines.length)})`)}"/>`);
+  });
+  out.push(`<text x="${c + R + 6}" y="${c + 4}">right</text><text x="${c - R - 6}" y="${c + 4}" text-anchor="end">left</text><text x="${c}" y="${c + R + 15}" text-anchor="middle">down</text><text x="${c}" y="${c - R - 6}" text-anchor="middle">up</text>`);
+  return hFig(caption, `<svg class="rose" viewBox="-30 -14 300 268" role="img" aria-label="${hEsc(caption)}">${out.join('')}</svg>`);
+}
+function hTimeline(tl) {
+  if (tl.length < 40) return '';
+  const nw = Math.min(40, Math.floor(tl.length / 15)), cuts = Array.from({ length: nw + 1 }, (_, w) => Math.floor((w * tl.length) / nw));
+  const t0 = tl[0][0], names = [...HAND_CLASSES.map((c) => c[0]), 'Fill (tagged)', 'White marks'];
+  const W = 640, H = 150, T = 6, B = 20, bw = W / nw, out = [];
+  for (let w = 0; w < nw; w++) {
+    const chunk = tl.slice(cuts[w], cuts[w + 1]), cnt = new Array(names.length).fill(0);
+    for (const x of chunk) cnt[x[1]]++;
+    let y = T + H;
+    const m0 = Math.round((chunk[0][0] - t0) / 60000), m1 = Math.round((chunk[chunk.length - 1][2] - t0) / 60000);
+    cnt.forEach((c, k) => {
+      if (!c) return;
+      const h = (c / chunk.length) * H;
+      out.push(`<rect class="s${k + 1}" x="${(w * bw + 1).toFixed(1)}" y="${(y - h + 1).toFixed(1)}" width="${(bw - 2).toFixed(1)}" height="${Math.max(h - 2, 0.5).toFixed(1)}" rx="1" data-tip="${hEsc(`Minutes ${m0}–${m1}: ${names[k].toLowerCase()} ${hPct(c, chunk.length)} (${c} of ${chunk.length} lines)`)}"/>`);
+      y -= h;
+    });
+  }
+  for (let w = 0; w <= nw; w += Math.max(1, Math.floor(nw / 5))) {
+    const k = Math.min(cuts[w], tl.length - 1);
+    out.push(`<text x="${Math.min(w * bw, W).toFixed(1)}" y="${T + H + 15}" text-anchor="${w === 0 ? 'start' : w === nw ? 'end' : 'middle'}">${Math.round((tl[k][0] - t0) / 60000)} min</text>`);
+  }
+  const present = [...new Set(tl.map((x) => x[1]))].sort((a, b) => a - b);
+  const legend = '<div class="legend">' + present.map((k) => `<span><i class="sw s${k + 1}"></i>${names[k]}</span>`).join('') + '</div>';
+  const cap = `What you drew, in order: each bar is 1/${nw} of the lines, split by kind of mark`;
+  return hFig(cap, legend + `<svg viewBox="0 0 ${W} ${T + H + B}" role="img" aria-label="${hEsc(cap)}">${out.join('')}</svg>`, 'Time under each bar is when that stretch started, counted from the first line.');
+}
+function hTable(head, rows) {
+  return `<div class="tw"><table><thead><tr>${head.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+}
+function hCell(l, white) {
+  const P = (l.st.cancelled ? l.st.samples : l.st.samples.slice(0, -1)).map((r) => [r[1], r[2]]);
+  if (!P.length) return '';
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const [x, y] of P) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+  const box = [0.6, 2, 7][l.cls], ext = Math.max(x1 - x0, y1 - y0);
+  let size = box || Math.max(ext, 1) * 1.15;
+  if (white) size = Math.max(size, ext + l.width * 1.6);
+  const step = size / 200, pts = [P[0]];
+  for (let i = 1; i < P.length - 1; i++) if (Math.hypot(P[i][0] - pts[pts.length - 1][0], P[i][1] - pts[pts.length - 1][1]) >= step) pts.push(P[i]);
+  if (P.length > 1) pts.push(P[P.length - 1]);
+  const d = pts.length === 1 ? `M${pts[0][0].toFixed(3)} ${pts[0][1].toFixed(3)}h0` : 'M' + pts.map((p) => `${p[0].toFixed(3)} ${p[1].toFixed(3)}`).join(' ');
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, name = HAND_CLASSES[l.cls][0].toLowerCase().replace(/s$/, '');
+  const tip = `${white ? 'White ' + name : name[0].toUpperCase() + name.slice(1)}: ${hG(l.length, 'mm')}, ${white ? `${l.width} mm wide, ` : ''}${hG(l.dur, 'ms')}, peak ${hG(l.peak, 'mm/s')}, pressure ${hG(l.pressure, '', 2)}`;
+  const sw = white ? ` style="stroke-width:${Math.max(l.width, size / 60).toFixed(3)}"` : '';
+  return `<svg class="cell${white ? ' neg' : ''}" viewBox="${(cx - size / 2).toFixed(3)} ${(cy - size / 2).toFixed(3)} ${size.toFixed(3)} ${size.toFixed(3)}" data-tip="${hEsc(tip)}" role="img" aria-label="${hEsc(tip)}"><path d="${d}"${sw}/></svg>`;
+}
+
+async function handSections(A, meta, emit) { // each section is built and shown in its own slice
+  const ink = A.lines.filter((l) => !l.fill && !l.white), whites = A.lines.filter((l) => l.white), nFill = A.lines.filter((l) => l.fill).length, N = ink.length;
+  const pauses = ink.map((l) => l.pause).filter((p) => p != null && p < H_BREAK), breaks = ink.filter((l) => l.pause != null && l.pause >= H_BREAK).length;
+  const sub = [nFill ? `${nFill.toLocaleString('en')} fill lines left out` : '', whites.length ? `${whites.length.toLocaleString('en')} white marks on their own` : ''].filter(Boolean).join(', ') || 'all pen lines';
+  const cards = [
+    ['Ink lines measured', N.toLocaleString('en'), sub],
+    ['Typical line', hG(hMed(ink.map((l) => l.length)), 'mm'), `${hG(hMed(ink.map((l) => l.dur)), 'ms')} with the pen down`],
+    ['Typical pause', hG(hMed(pauses), 'ms'), 'between one line and the next'],
+    ['Typical peak speed', hG(hMed(ink.map((l) => l.peak)), 'mm/s'), `fastest 1%: over ${hG(hPctl(ink.map((l) => l.peak), 0.99), 'mm/s')}`],
+    ['Typical pressure', hG(hMed(ink.map((l) => l.pressure)), '', 2), '0 to 1, as the pen reports it'],
+    ['Pen on paper', `${Math.round(A.penMin)} min`, `of ${Math.round(A.spanMin)} min from first to last line`],
+  ];
+  await emit('<div class="cards">' + cards.map(([a, b, c]) => `<div class="card"><div class="k">${a}</div><div class="v">${hEsc(b)}</div><div class="s">${hEsc(c)}</div></div>`).join('') + '</div>');
+  if (N < 20) { await emit('<p class="lead">Draw a little more first: there are too few lines here to say much.</p>'); return; }
+
+  // marks
+  const rows = HAND_CLASSES.map(([name, , , what], k) => {
+    const ls = ink.filter((l) => l.cls === k), pos = ls.filter((l) => l.length > 0);
+    return [`<i class="sw s${k + 1}"></i> ${name}`, what, ls.length.toLocaleString('en'), hPct(ls.length, N), hG(hMed(ls.map((l) => l.dur)), 'ms'),
+      hG(hMed(ls.map((l) => l.peak)), 'mm/s'), hG(hMed(ls.map((l) => l.pressure)), '', 2), hPct(pos.filter((l) => l.chord >= 0.8 * l.length).length, pos.length)];
+  });
+  let sec = `<section><h2>Your marks</h2><p class="lead">${hPct(ink.filter((l) => l.cls <= 1).length, N)} of your lines are under 1.5 mm long. Sorting by length is only a first cut; grouping by the whole movement comes later.</p>`
+    + hTable(['Mark', 'Length', 'Lines', 'Share', 'Pen down', 'Peak speed', 'Pressure', 'Nearly straight'], rows)
+    + '<p class="note">Medians. Nearly straight: the distance from start to end is at least 80% of the path.</p>';
+  HAND_CLASSES.forEach(([name], k) => {
+    const pick = hSample(ink.filter((l) => l.cls === k), k < 3 ? 24 : 12, 3 + k);
+    if (!pick.length) return;
+    const box = [0.6, 2, 7][k];
+    sec += `<h3>${name} <span class="sub">${pick.length} at random, ${box ? `each box is ${box} mm wide` : 'each scaled to fit its box'}</span></h3><div class="gal">${pick.map((l) => hCell(l, false)).join('')}</div>`;
+  });
+  sec += '<div class="figs">' + hHist(ink.map((l) => l.length), 0.01, 100, { log: true, unit: 'mm', caption: 'Line length (logarithmic scale)' })
+    + hHist(ink.map((l) => l.dur), 1, 5000, { log: true, unit: 'ms', caption: 'Time with the pen down per line (logarithmic scale)' }) + '</div></section>';
+  await emit(sec);
+
+  // white marks
+  if (whites.length) {
+    const wr = [];
+    HAND_CLASSES.forEach(([name], k) => {
+      const ls = whites.filter((l) => l.cls === k);
+      if (ls.length) wr.push([name, ls.length.toLocaleString('en'), hPct(ls.length, whites.length), hG(hMed(ls.map((l) => l.dur)), 'ms'), hG(hMed(ls.map((l) => l.peak)), 'mm/s'), hG(hMed(ls.map((l) => l.pressure)), '', 2), [...new Set(ls.map((l) => l.width))].sort((a, b) => a - b).join(', ') + ' mm']);
+    });
+    wr.push(['<b>All white marks</b>', `<b>${whites.length.toLocaleString('en')}</b>`, '', hG(hMed(whites.map((l) => l.dur)), 'ms'), hG(hMed(whites.map((l) => l.peak)), 'mm/s'), hG(hMed(whites.map((l) => l.pressure)), '', 2), '']);
+    wr.push(['All ink lines', N.toLocaleString('en'), '', hG(hMed(ink.map((l) => l.dur)), 'ms'), hG(hMed(ink.map((l) => l.peak)), 'mm/s'), hG(hMed(ink.map((l) => l.pressure)), '', 2), '']);
+    const ts = whites.map((l) => l.t0).sort((a, b) => a - b), first = A.timeline[0][0], spans = [];
+    let s0 = ts[0];
+    for (let i = 0; i < ts.length; i++) if (i === ts.length - 1 || ts[i + 1] - ts[i] > 5 * 60000) {
+      const m0 = Math.round((s0 - first) / 60000), m1 = Math.round((ts[i] - first) / 60000);
+      spans.push(m1 > m0 ? `${m0}–${m1} min` : `${m0} min`); s0 = ts[i + 1];
+    }
+    await emit(`<section><h2>White marks</h2><p class="lead">${whites.length.toLocaleString('en')} white marks, made with the white pen or by cutting through the ink with the eraser: drawing in white, not corrections. Made in ${spans.length} stretch${spans.length === 1 ? '' : 'es'}: ${spans.join(', ')}.</p>`
+      + hTable(['Mark', 'Marks', 'Share', 'Pen down', 'Peak speed', 'Pressure', 'Widths'], wr)
+      + '<p class="note">Medians. Sizes are sorted by the same lengths as ink lines.</p>'
+      + `<h3>Examples <span class="sub">at random, at their real width</span></h3><div class="gal">${hSample(whites, 24, 9).map((l) => hCell(l, true)).join('')}</div></section>`);
+  }
+
+  // speed, pressure, direction, rhythm
+  await emit('<section><h2>Speed</h2><p class="lead">Speed is measured over at least 10 ms, so the jitter of a fast pen does not count as movement.</p><div class="figs">'
+    + hScatter(ink) + hHist(ink.map((l) => l.peak), 0.5, 500, { log: true, unit: 'mm/s', caption: 'Peak speed per line (logarithmic scale)' }) + '</div></section>');
+  const alts = ink.map((l) => l.altitude).filter(Number.isFinite);
+  await emit('<section><h2>Pressure and pen angle</h2><div class="figs">' + hProfiles(ink) + hHist(ink.map((l) => l.pressure), 0, 1, { caption: 'Median pressure per line' })
+    + (alts.length ? hHist(alts, 20, 90, { unit: '°', caption: 'How upright you hold the pen (angle from the page, 90° = straight up)' }) : '') + '</div></section>');
+  const ticks = ink.filter((l) => l.cls === 1), longer = ink.filter((l) => l.cls >= 2);
+  await emit('<section><h2>Direction</h2><p class="lead">Which way each line travels from where the pen lands to where it lifts, as seen on the page. Wedge area is true to the number of lines.</p>'
+    + `<div class="figs roses">${hRose(ticks, `Ticks (${ticks.length.toLocaleString('en')})`)}${hRose(longer, `Short and long lines (${longer.length.toLocaleString('en')})`)}</div></section>`);
+  const travel = ink.filter((l) => l.travel != null && l.pause != null && l.pause < H_BREAK).map((l) => l.travel);
+  await emit(`<section><h2>Rhythm</h2><p class="lead">${hPct(pauses.filter((p) => p < 200).length, pauses.length)} of pauses between lines are under 200 ms. ${breaks} break${breaks === 1 ? '' : 's'} of over a minute ${breaks === 1 ? 'is' : 'are'} left out of these charts.</p><div class="figs">`
+    + hHist(pauses, 10, H_BREAK, { log: true, unit: 'ms', caption: 'Pause before each line (logarithmic scale)' })
+    + hHist(travel, 0.01, 200, { log: true, unit: 'mm', caption: 'How far the pen moves in the air between lines (logarithmic scale)' }) + '</div></section>');
+
+  // parts
+  const groups = new Map();
+  for (const l of ink) for (const k of l.kinds.length ? l.kinds : [null]) { if (!groups.has(k)) groups.set(k, []); groups.get(k).push(l); }
+  const prow = [...groups].filter(([, ls]) => ls.length >= 20).sort((a, b) => (a[0] === null) - (b[0] === null) || String(a[0]).localeCompare(String(b[0]))).map(([k, ls]) => {
+    const ps = ls.map((l) => l.pause).filter((p) => p != null && p < H_BREAK);
+    return [hEsc(k || 'Not in a part'), ls.length.toLocaleString('en'), hG(hMed(ls.map((l) => l.length)), 'mm'), hG(hMed(ls.map((l) => l.dur)), 'ms'), hG(hMed(ls.map((l) => l.peak)), 'mm/s'),
+      hG(hMed(ls.map((l) => l.pressure)), '', 2), hG(hMed(ps), 'ms'), hPct(ls.filter((l) => l.cls === 0).length, ls.length), hPct(ls.filter((l) => l.cls === 1).length, ls.length)];
+  });
+  if (prow.length > 1) await emit('<section><h2>Parts</h2><p class="lead">Lines inside each kind of part you marked, next to everything else. Medians.</p>'
+    + hTable(['Kind', 'Lines', 'Length', 'Pen down', 'Peak speed', 'Pressure', 'Pause before', 'Dots', 'Ticks'], prow) + '</section>');
+  const drows = [...A.devices].sort().map((dv) => {
+    const ls = ink.filter((l) => l.device === dv), iv = hMed(A.rates.get(dv) || []);
+    return [hEsc(dv), ls.length.toLocaleString('en'), Number.isFinite(iv) && iv > 0 ? `${Math.round(1000 / iv)} Hz` : '–', hG(hMed(ls.map((l) => l.length)), 'mm'), hG(hMed(ls.map((l) => l.peak)), 'mm/s'), hG(hMed(ls.map((l) => l.pressure)), '', 2), hG(hMed(ls.map((l) => l.tilt)), '°')];
+  });
+  await emit('<section><h2>Devices</h2><p class="lead">Pressure and tilt are reported differently by each pen, so compare them within a device.</p>'
+    + hTable(['Device', 'Lines', 'Sample rate', 'Length', 'Peak speed', 'Pressure', 'Tilt from vertical'], drows) + '</section>');
+
+  // this drawing over time; the pictures are painted into the canvases afterwards
+  await emit(`<section><h2>Over time</h2><p class="lead">${(A.timeline.length - A.white).toLocaleString('en')} ink lines and ${A.white.toLocaleString('en')} white marks, ${Math.round(A.penMin)} min with the pen down over ${Math.round(A.spanMin)} min; ${A.undo} undo${A.undo === 1 ? '' : 's'}${A.cancelled ? `, ${A.cancelled} cancelled` : ''}. ${hEsc([...A.devices].join(', '))}.</p>`
+    + hTimeline(A.timeline)
+    + '<h3>How it grew</h3><div class="frames">' + [25, 50, 75, 100].map((q) => `<figure class="frame"><canvas data-q="${q}" role="img" aria-label="Lines ${q - 25} to ${q}% in black, earlier lines grey"></canvas><figcaption>Lines ${q - 25}–${q}%</figcaption></figure>`).join('') + '</div>'
+    + '<p class="note">Each frame adds a quarter of the lines, in black; earlier lines are grey. Lines are shown as they ended up, with the white marks already cut in.</p>'
+    + '<h3>When each part was drawn</h3><div class="tmap"><canvas role="img" aria-label="The drawing coloured by when each line was drawn"></canvas><div class="ramp"><span>first lines</span>' + [0, 1, 2, 3, 4, 5, 6, 7].map((k) => `<i class="t${k}"></i>`).join('') + '<span>last lines</span></div></div></section>');
+}
+
+// growth frames and the time map, painted with the app's own line renderer, a slice at a time
+async function handPictures(root, strokes, isLive) {
+  const vis = strokes.filter((s) => s.tool !== 'eraser' && !s.undone_at && !s.cancelled && s.samples.length).sort((a, b) => a.t0 - b.t0);
+  if (!vis.length) return;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const s of vis) { const b = bboxOf(s); x0 = Math.min(x0, b.x0); y0 = Math.min(y0, b.y0); x1 = Math.max(x1, b.x1); y1 = Math.max(y1, b.y1); }
+  const m = Math.max(3, 0.04 * Math.max(x1 - x0, y1 - y0)), box = { x0: x0 - m, y0: y0 - m, w: x1 - x0 + 2 * m, h: y1 - y0 + 2 * m };
+  const css = getComputedStyle(root), v = (n) => css.getPropertyValue(n).trim();
+  const paper = v('--paper') || '#ffffff', tpaper = v('--tpaper') || '#ffffff', ramp = [0, 1, 2, 3, 4, 5, 6, 7].map((k) => v(`--t${k}`) || '#2a78d6');
+  const make = (cv, px) => { // px: pixels across the width (capped so tall drawings stay reasonable)
+    const K = Math.min(px / box.w, (px * 2) / box.h);
+    cv.width = Math.max(1, Math.round(box.w * K)); cv.height = Math.max(1, Math.round(box.h * K));
+    const x = cv.getContext('2d');
+    return { x, K };
+  };
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const frames = [...root.querySelectorAll('.frames canvas')], tmap = root.querySelector('.tmap canvas');
+  const bucket = (i) => Math.min(7, Math.floor((i / vis.length) * 8));
+  const paint = async (ctx, K, bg, list, colorOf) => {
+    let i = 0;
+    while (i < list.length) {
+      if (!isLive()) return false;
+      const end = performance.now() + 12;
+      ctx.setTransform(K, 0, 0, K, -box.x0 * K, -box.y0 * K);
+      minLineMm = 0.9 / K; // hairlines stay visible at this small size
+      while (i < list.length && performance.now() < end) { const [s, k] = list[i++]; drawStroke(ctx, s, 0, undefined, true, colorOf(s, k)); }
+      minLineMm = 0;
+      await yieldNow();
+    }
+    return true;
+  };
+  const fill = (ctx, bg) => { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = bg; ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height); };
+  const order = vis.map((s, i) => [s, bucket(i)]);
+  // frames: a running grey picture of everything before, plus this quarter in black
+  const grey = document.createElement('canvas'), fpx = Math.round(Math.min(800, Math.max(240, (frames[0].clientWidth || 240) * dpr)));
+  const g = make(grey, fpx); fill(g.x, paper);
+  for (let q = 0; q < 4; q++) {
+    const f = make(frames[q], fpx); fill(f.x, paper);
+    f.x.setTransform(1, 0, 0, 1, 0, 0); f.x.drawImage(grey, 0, 0);
+    const now = order.filter(([, k]) => k >= q * 2 && k < q * 2 + 2);
+    if (!(await paint(f.x, f.K, paper, now, (s) => (s.ink === 'white' ? paper : '#141414')))) return;
+    if (!(await paint(g.x, g.K, paper, now, (s) => (s.ink === 'white' ? paper : '#b9b6ae')))) return;
+  }
+  const t = make(tmap, Math.round(Math.min(1400, Math.max(400, (tmap.clientWidth || 500) * dpr)))); fill(t.x, tpaper);
+  await paint(t.x, t.K, tpaper, order, (s, k) => (s.ink === 'white' ? tpaper : ramp[k]));
+}
+
+const Hand = {
+  gen: 0,
+  async open() {
+    if (!S.meta) return;
+    const dlg = $('#hand-dlg'), body = $('#hand-body'), gen = ++this.gen, live = () => gen === this.gen && dlg.open;
+    body.innerHTML = '';
+    $('#hand-sub').textContent = S.meta.title || 'This drawing';
+    $('#hand-progress').hidden = false; $('#hand-progress').classList.add('big'); $('#hand-fill').style.width = '0%';
+    $('#hand-step').textContent = 'Getting the lines ready';
+    dlg.showModal();
+    dlg.scrollTop = 0;
+    await waitIdle();
+    const strokes = S.strokes.slice(), meta = S.meta;
+    const events = await DB.events(meta.id).catch(() => []);
+    const total = strokes.length;
+    const A = await handAnalyse(strokes, meta, events, (f) => {
+      if (!live()) return;
+      $('#hand-fill').style.width = `${Math.round(f * 70)}%`;
+      $('#hand-step').textContent = `Measuring lines: ${Math.round(f * total).toLocaleString('en')} of ${total.toLocaleString('en')}`;
+    });
+    if (!live()) return;
+    $('#hand-step').textContent = 'Drawing the charts';
+    try {
+      await handSections(A, meta, async (html) => { // one section at a time, so the page keeps breathing
+        if (!live()) throw new Error('closed');
+        body.insertAdjacentHTML('beforeend', html);
+        $('#hand-progress').classList.remove('big');
+        $('#hand-fill').style.width = `${Math.min(88, parseFloat($('#hand-fill').style.width) + 2)}%`;
+        await yieldNow();
+      });
+    } catch (err) { if (err.message === 'closed') return; throw err; }
+    $('#hand-step').textContent = 'Painting the pictures'; $('#hand-fill').style.width = '90%';
+    if (body.querySelector('.frames')) await handPictures(body, strokes, live);
+    if (live()) $('#hand-progress').hidden = true;
+  },
+  close() { this.gen++; $('#hand-dlg').close(); $('#hand-tip').hidden = true; },
+  tip(e) {
+    const tip = $('#hand-tip'), t = e.target.closest && e.target.closest('#hand-body [data-tip]');
+    if (!t) { tip.hidden = true; return; }
+    tip.textContent = t.getAttribute('data-tip'); tip.hidden = false;
+    const x = Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 8), below = e.clientY + 16 + tip.offsetHeight < innerHeight;
+    tip.style.left = `${Math.max(8, x)}px`; tip.style.top = `${below ? e.clientY + 16 : e.clientY - tip.offsetHeight - 10}px`;
+  },
+};
+
 /* ------------------------------------------------------------ UI */
 const ICONS = {
   eraser: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M4 16.5 13.5 7l5 5L9 21.5H6L4 19.5z"/><path d="M9 11.5l5 5M10 21.5h10"/></svg>',
@@ -2644,6 +3073,11 @@ function bindUI() {
   $('#lab-go').onclick = () => Replay.label();
   $('#lab-list').onclick = () => openPartsList();
   $('#m-parts').onclick = () => { $('#menu').close(); openPartsList(); };
+  $('#m-hand').onclick = () => { $('#menu').close(); Hand.open(); };
+  $('#hand-close').onclick = () => Hand.close();
+  $('#hand-dlg').addEventListener('close', () => { Hand.gen++; $('#hand-tip').hidden = true; });
+  for (const t of ['pointermove', 'pointerdown']) $('#hand-dlg').addEventListener(t, (e) => Hand.tip(e));
+  $('#hand-dlg').addEventListener('scroll', () => { $('#hand-tip').hidden = true; }, { passive: true });
   $('#parts-list').addEventListener('change', (e) => { const el = e.target.closest('[data-kind]'); if (el) setPartKind(el.dataset.kind, el.value); });
   $('#parts-list').onclick = (e) => {
     const sh = e.target.closest('[data-show]');
@@ -2782,7 +3216,7 @@ async function init() {
 }
 
 // test hook (used by automated checks; harmless in normal use)
-window.__nh = { S, setInk, toggleInk, svgOf, openDrawing, Loader, applyRemote, buildExport, undo, redo, togglePart, startPart, endPart, migrateFigures, partMembers, fit, Drive, syncAll, mergeData, Replay, Video };
+window.__nh = { S, Hand, handAnalyse, setInk, toggleInk, svgOf, openDrawing, Loader, applyRemote, buildExport, undo, redo, togglePart, startPart, endPart, migrateFigures, partMembers, fit, Drive, syncAll, mergeData, Replay, Video };
 
 init();
 })();
