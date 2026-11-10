@@ -100,6 +100,8 @@ Undo never deletes data: undone strokes stay in the file, marked with the time t
 
 **Pressure feel.** Menu, This device: set how hard you press for the ink pen and brush pen to reach full width, separately for each device, so the S Pen and the Wacom feel alike. It changes only the drawn width; recorded pressure stays raw, and each stroke stores the setting.
 
+**Negative drawings.** In New drawing, choose Paper colour: Black to draw white on black. The page, replay, video, image exports and thumbnails are black; the pen starts in white ink, black ink carves back into the white, and a cut-through eraser cuts back to black. The pen always starts with the ink that shows on the paper you open. The data says `"paper": {..., "tone": "black"}`; the report then counts white lines as your marks and black ones as marks cut back in.
+
 **White ink.** In the width button, choose White to draw in white: white dots, white hairs, white lines carved into a black mass. White paints over what is already there, and anything drawn after it paints over the white, exactly in the order you drew. The pen button shows a white line on black while white is on; W switches back and forth. Width and pen type are shared with black. White marks are recorded as lines with `"ink": "white"`: they are drawing, not corrections, and the eraser and undo work on them like on any line.
 
 **Pen types.** Technical pen keeps one width. Ink pen and brush pen change width with pressure: ink pen gently, brush pen strongly, with thin starts and ends. The pressure itself is recorded the same way for all three.

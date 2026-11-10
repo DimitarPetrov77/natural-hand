@@ -86,6 +86,11 @@ class Drawing:
         return [s for s in self.strokes if not s.undone and s.tool != "eraser"]
 
     @property
+    def tone(self):
+        """Paper colour: "white", or "black" for a negative drawing (drawn mostly in white ink)."""
+        return "black" if (self.meta.get("paper") or {}).get("tone") == "black" else "white"
+
+    @property
     def parts(self):
         """Parts that count: {id: {"kind", "parent", "source", ...}} without removed ones."""
         return {k: v for k, v in (self.meta.get("parts") or {}).items() if not v.get("removed_at")}

@@ -233,7 +233,8 @@
   #hand-body .gal{display:grid;grid-template-columns:repeat(auto-fill,minmax(60px,1fr));gap:6px}
   #hand-body .cell{overflow:hidden;aspect-ratio:1;background:var(--paper);border-radius:6px}
   #hand-body .cell path{fill:none;stroke:var(--pen);stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke}
-  #hand-body .cell.neg{background:#141414} #hand-body .cell.neg path{stroke:#ffffff;vector-effect:none}
+  #hand-body .cell.neg{background:#141414} #hand-body .cell.neg path{stroke:#ffffff}
+  #hand-body .cell.real path{vector-effect:none} #hand-body .cell.real:not(.neg) path{stroke:#141414}
   #hand-body .frames{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(46%,200px),1fr));gap:12px}
   #hand-body .frame figcaption{margin:4px 0 0}
   #hand-body canvas{display:block;width:100%;height:auto;border-radius:4px;box-shadow:0 0 0 1px var(--hline);background:var(--paper)}
@@ -255,7 +256,7 @@
   <button id="undo-btn" title="Undo (Ctrl+Z)"></button>
   <button id="redo-btn" title="Redo (Ctrl+Shift+Z)"></button>
   <button id="part-btn" class="tag" title="Start or end a part (F). Hold to choose its kind (Shift+F)" aria-pressed="false" aria-haspopup="true"></button>
-  <button id="fill-btn" class="tag" title="Mark black fill (G)" aria-pressed="false"></button>
+  <button id="fill-btn" class="tag" title="Mark a fill (G)" aria-pressed="false"></button>
   <div class="spacer"></div>
   <button id="fit-btn" title="Fit page (0)"></button>
   <button id="menu-btn" title="Menu"></button>
@@ -383,6 +384,9 @@
     </label>
     <label id="n-orient-row">Orientation
       <select id="n-orient"><option value="p">Portrait</option><option value="l">Landscape</option></select>
+    </label>
+    <label>Paper colour
+      <select id="n-tone"><option value="white">White</option><option value="black">Black (negative: draw in white)</option></select>
     </label>
     <label>Title <input id="n-title" placeholder="Optional"></label>
     <div class="row"><button class="btn primary" id="n-create">Create</button><button class="btn" id="n-cancel">Cancel</button></div>

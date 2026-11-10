@@ -8,7 +8,7 @@
 'use strict';
 (() => {
 
-const APP_VERSION = '0.9.0';
+const APP_VERSION = '0.10.0';
 const FORMAT = 'natural-hand/1';
 const SAMPLE_FIELDS = ['dt_ms','x_mm','y_mm','pressure','tiltX','tiltY','twist','altitude','azimuth','tangential','width_px','height_px','buttons'];
 const PAPERS = { A5: [148, 210], A4: [210, 297], A3: [297, 420], A2: [420, 594], A1: [594, 841], Square: [300, 300] };
@@ -188,7 +188,7 @@ function render() {
   updateZoomChip();
   vctx.setTransform(1, 0, 0, 1, 0, 0);
   if (S.paper && !Replay.on && sharpKey === viewKey()) { vctx.drawImage(sharp, 0, 0); return; }
-  vctx.fillStyle = S.paper && S.endless ? '#ffffff' : surround;
+  vctx.fillStyle = S.paper && S.endless ? paperColor() : surround;
   vctx.fillRect(0, 0, view.width, view.height);
   if (!S.paper) return;
   const v = S.view, k = S.ppmm * v.s, pp = Replay.on ? Replay.paper : S.paper, b = pp.b;
@@ -242,7 +242,7 @@ function renderSharp() {
   if (gesture || mousePan) { scheduleSharp(); return; }
   if (sharp.width !== view.width || sharp.height !== view.height) { sharp.width = view.width; sharp.height = view.height; }
   sctx.setTransform(1, 0, 0, 1, 0, 0);
-  sctx.fillStyle = S.endless ? '#ffffff' : surround;
+  sctx.fillStyle = S.endless ? paperColor() : surround;
   sctx.fillRect(0, 0, sharp.width, sharp.height);
   applyView(sctx);
   const pb = S.paper.b;
@@ -253,7 +253,7 @@ function renderSharp() {
     requestRender();
     return;
   }
-  sctx.fillStyle = '#ffffff';
+  sctx.fillStyle = paperColor();
   if (!S.endless) sctx.fillRect(pb.x0, pb.y0, pb.w, pb.h);
   sctx.save(); clipPaper(sctx);
   const r = visibleDocRect();
@@ -350,9 +350,15 @@ function maybeExtend() {
 }
 // a whole-line eraser shows a light trail while you drag; a cutting eraser paints white
 const eraseModeOf = (st) => st.erase_mode || 'cut';
+/* Paper is white, or black for a negative drawing (meta.paper.tone = 'black'). Ink is
+ * literal: white ink is white on any paper. Ink the colour of the paper cuts back into
+ * the drawing, like a cut-through eraser. */
+const PAPER = { white: '#ffffff', black: '#000000' };
+const paperTone = (meta = S.meta) => (meta && meta.paper && meta.paper.tone === 'black' ? 'black' : 'white');
+const paperColor = (meta = S.meta) => PAPER[paperTone(meta)];
 function inkOf(st) {
   if (st.tool !== 'eraser') return st.ink === 'white' ? '#ffffff' : '#000000';
-  return eraseModeOf(st) === 'stroke' ? '#a4dded' : '#ffffff';
+  return eraseModeOf(st) === 'stroke' ? '#a4dded' : paperColor();
 }
 /* Smoothing: `raw` keeps exactly what the device reported; `samples` is the smoothed
  * path that is drawn and analysed. Positions pass through a time-based exponential
@@ -596,7 +602,7 @@ function eraserChanged(E, changed) {
   for (const st of changed) saveStroke(st);
   repaintRegion([E, ...changed].map(bboxOf).reduce(unionBox));
 }
-function paintAll(ctx, strokes, b, K, bg = '#ffffff') {
+function paintAll(ctx, strokes, b, K, bg = paperColor()) {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   if (bg) { ctx.fillStyle = bg; ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height); }
   else ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
@@ -612,7 +618,7 @@ const yieldNow = () => new Promise((r) => setTimeout(r, 0));
 function repaint(onProgress) {
   const gen = ++paintGen, p = S.paper, { x, K, b } = p, list = S.strokes.slice();
   x.setTransform(1, 0, 0, 1, 0, 0);
-  x.fillStyle = '#ffffff'; x.fillRect(0, 0, x.canvas.width, x.canvas.height);
+  x.fillStyle = paperColor(); x.fillRect(0, 0, x.canvas.width, x.canvas.height);
   x.setTransform(K, 0, 0, K, -b.x0 * K, -b.y0 * K);
   painting = true;
   let i = 0;
@@ -647,7 +653,7 @@ function repaintRegion(r) {
     x.save();
     x.setTransform(1, 0, 0, 1, 0, 0);
     x.beginPath(); x.rect(X0, Y0, X1 - X0, Y1 - Y0); x.clip();
-    x.fillStyle = '#ffffff'; x.fillRect(X0, Y0, X1 - X0, Y1 - Y0);
+    x.fillStyle = paperColor(); x.fillRect(X0, Y0, X1 - X0, Y1 - Y0);
     x.setTransform(K, 0, 0, K, -b.x0 * K, -b.y0 * K);
     for (const st of strokesIn({ x0: b.x0 + X0 / K, y0: b.y0 + Y0 / K, x1: b.x0 + X1 / K, y1: b.y0 + Y1 / K })) drawStroke(x, st);
     x.restore();
@@ -665,9 +671,9 @@ function repaintRegion(r) {
         sctx.save();
         sctx.setTransform(1, 0, 0, 1, 0, 0);
         sctx.beginPath(); sctx.rect(SX0, SY0, SX1 - SX0, SY1 - SY0); sctx.clip();
-        sctx.fillStyle = S.endless ? '#ffffff' : surround; sctx.fillRect(SX0, SY0, SX1 - SX0, SY1 - SY0);
+        sctx.fillStyle = S.endless ? paperColor() : surround; sctx.fillRect(SX0, SY0, SX1 - SX0, SY1 - SY0);
         applyView(sctx);
-        if (!S.endless) { const pb = S.paper.b; sctx.fillStyle = '#ffffff'; sctx.fillRect(pb.x0, pb.y0, pb.w, pb.h); }
+        if (!S.endless) { const pb = S.paper.b; sctx.fillStyle = paperColor(); sctx.fillRect(pb.x0, pb.y0, pb.w, pb.h); }
         clipPaper(sctx);
         for (const st of strokesIn(rr)) drawStroke(sctx, st);
         sctx.restore();
@@ -936,6 +942,7 @@ function setSmoothing(v) { S.smoothing = clamp(Math.round(v), 0, 100); localStor
 function setInk(ink) {
   S.ink = ink === 'white' ? 'white' : 'black';
   localStorage.setItem('nh-ink', S.ink);
+  if (S.meta) localStorage.setItem('nh-ink-paper', paperTone());
   if (S.tool === 'eraser') { S.tool = 'pen'; buildNibs(); }
   updateTools();
 }
@@ -1051,7 +1058,7 @@ function newId() {
   const d = new Date();
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}_${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}_${uid().slice(0, 4)}`;
 }
-async function newDrawing(paperName, landscape, title) {
+async function newDrawing(paperName, landscape, title, tone = 'white') {
   let paper;
   if (paperName === 'Endless') paper = { name: 'Endless', endless: true, x0: -200, y0: -200, w_mm: 400, h_mm: 400 };
   else {
@@ -1059,6 +1066,7 @@ async function newDrawing(paperName, landscape, title) {
     const [W, H] = landscape ? [b, a] : [a, b];
     paper = { name: paperName, w_mm: W, h_mm: H };
   }
+  if (tone === 'black') paper.tone = 'black'; // a negative drawing
   const now = new Date().toISOString();
   const meta = {
     id: newId(), format: FORMAT, title: title || '', created: now, updated: now,
@@ -1140,6 +1148,10 @@ async function openDrawing(id) {
       meta.erasure = 1; scheduleMetaSave(); p0 = 0.65;
     }
     localStorage.setItem('nh-last', id);
+    if (localStorage.getItem('nh-ink-paper') !== paperTone(meta)) { // other paper colour than last time: start with ink that shows on it
+      S.ink = paperTone(meta) === 'black' ? 'white' : 'black';
+      localStorage.setItem('nh-ink', S.ink); localStorage.setItem('nh-ink-paper', paperTone(meta));
+    }
     if (meta.view) S.view = { ...meta.view }; else fit();
     updateTools(); setSaveState('Saved'); updateDriveChip();
     // 3. paint the page
@@ -1192,7 +1204,8 @@ async function buildExport(id) {
       samples: 'the drawn path: positions smoothed with an exponential filter (time constant smoothing_tau_ms); all other columns as reported by the device',
       raw: 'present when smoothing_tau_ms > 0: the unsmoothed device samples, same columns; absent means samples are raw',
       brush: 'technical (constant width), ink (width from pressure, mild), brush (width from pressure, strong); width_mm is the nominal width',
-      ink: 'on pen strokes: "black" or "white" (absent means black). White ink paints over what was drawn before it; later lines paint over it. White marks are drawing, not corrections',
+      ink: 'on pen strokes: "black" or "white" (absent means black). Ink paints over what was drawn before it; later lines paint over it. Ink the colour of the paper (and cut-through erasing) cuts back into the drawing: drawing, not corrections',
+      paper_tone: 'paper.tone "black" marks a negative drawing: black paper, drawn mostly in white ink; absent means white paper',
       parts: 'on strokes: ids of every part (figure, head, structure...) the stroke belongs to. In the drawing, parts = {id: {kind, parent, source, session, created, removed_at?}}: kind is the artist\'s word for the thing, parent the part it sits inside, source "live" (marked while drawing), "replay" (labelled afterwards) or "figure" (a figure from before parts existed). Parts with removed_at were taken back and should be ignored',
       figure: 'older strokes only: the figure number from before parts existed; the same strokes are in part "fig-N"',
       erased: '[[first_sample, last_sample, eraser_stroke_i], ...] parts of this stroke removed by later eraser strokes; the final drawing omits them',
@@ -1231,7 +1244,7 @@ async function previewPng(id) {
     const c = document.createElement('canvas');
     c.width = Math.max(1, Math.round(b.w * K)); c.height = Math.max(1, Math.round(b.h * K));
     const x = c.getContext('2d');
-    x.fillStyle = '#ffffff'; x.fillRect(0, 0, c.width, c.height);
+    x.fillStyle = paperColor(); x.fillRect(0, 0, c.width, c.height);
     x.imageSmoothingEnabled = true; x.imageSmoothingQuality = 'high';
     x.drawImage(p.c, (b.x0 - p.b.x0) * p.K, (b.y0 - p.b.y0) * p.K, b.w * p.K, b.h * p.K, 0, 0, c.width, c.height);
     return canvasBlob(c, 'image/png');
@@ -1239,7 +1252,7 @@ async function previewPng(id) {
   const meta = cur ? S.meta : await DB.get('drawings', id);
   const strokes = cur ? S.strokes : (await DB.strokes(id)).sort((a, b) => a.i - b.i).map(normalizeStroke);
   const b = imageBounds(meta, strokes), K = Math.min(6, 2400 / Math.max(b.w, b.h));
-  return canvasBlob(renderImage(strokes, b, K, '#ffffff'), 'image/png');
+  return canvasBlob(renderImage(strokes, b, K, paperColor(meta)), 'image/png');
 }
 /* Compression and parsing of whole drawings run in a small background worker: in Chrome
  * CompressionStream works on the calling thread, and big drawings would freeze the page.
@@ -1626,7 +1639,7 @@ function svgOf(meta, strokes, transparent) {
     `<svg xmlns="http://www.w3.org/2000/svg" width="${f(b.w)}mm" height="${f(b.h)}mm" viewBox="${f(b.x0)} ${f(b.y0)} ${f(b.w)} ${f(b.h)}">`,
     `<title>${esc(meta.title || meta.id)}</title>`,
   ];
-  if (!transparent) out.push(`<rect x="${f(b.x0)}" y="${f(b.y0)}" width="${f(b.w)}" height="${f(b.h)}" fill="#ffffff"/>`);
+  if (!transparent) out.push(`<rect x="${f(b.x0)}" y="${f(b.y0)}" width="${f(b.w)}" height="${f(b.h)}" fill="${paperColor(meta)}"/>`);
   out.push('<g fill="none" stroke="#000000" stroke-linecap="round" stroke-linejoin="round">');
   for (const st of strokes) {
     if (st.undone_at || st.tool === 'eraser') continue;
@@ -1646,7 +1659,7 @@ async function makeExportFile() {
     return new File([text], `${fileBase()}.svg`, { type: 'image/svg+xml' });
   }
   const { b, K } = exportPlan(S.meta, S.strokes);
-  const blob = await canvasBlob(renderImage(S.strokes, b, K, transparent ? null : '#ffffff'), 'image/png');
+  const blob = await canvasBlob(renderImage(S.strokes, b, K, transparent ? null : paperColor()), 'image/png');
   return new File([blob], `${fileBase()}.png`, { type: 'image/png' });
 }
 function updateExportInfo() {
@@ -2121,7 +2134,7 @@ const Video = {
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.fillStyle = bg; ctx.fillRect(0, 0, plan.W, plan.H);
         ctx.setTransform(K, 0, 0, K, -b.x0 * K, -b.y0 * K);
-        ctx.fillStyle = '#ffffff'; ctx.fillRect(pr.x0, pr.y0, pr.w, pr.h);
+        ctx.fillStyle = paperColor(); ctx.fillRect(pr.x0, pr.y0, pr.w, pr.h);
       },
     });
     eng.build();
@@ -2342,14 +2355,14 @@ function hRand(seed) { let a = seed >>> 0; return () => { a = (a + 0x6d2b79f5) >
 function hSample(list, n, seed) { const r = hRand(seed), a = list.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a.slice(0, n); }
 
 async function handAnalyse(strokes, meta, events, onProgress) {
-  const order = strokes.filter((s) => s.samples.length).sort((a, b) => a.t0 - b.t0);
+  const order = strokes.filter((s) => s.samples.length).sort((a, b) => a.t0 - b.t0), tone = paperTone(meta);
   const devOf = new Map((meta.sessions || []).map((s) => [s.id, (s.device && s.device.name) || '?']));
   const parts = meta.parts || {};
   const lines = [], timeline = [], rates = new Map(), devices = new Set();
   let prev = null, cancelled = 0, white = 0, penMs = 0, end = performance.now() + 12;
   for (let k = 0; k < order.length; k++) {
     const st = order[k], src = st.raw || st.samples, raw = st.cancelled ? src : src.slice(0, -1);
-    const endT = st.t0 + src[src.length - 1][0], isWhite = st.tool === 'eraser' || st.ink === 'white';
+    const endT = st.t0 + src[src.length - 1][0], isWhite = st.tool === 'eraser' || (st.ink || 'black') === tone; // cut back into the drawing
     if (st.cancelled) cancelled++;
     if (!st.undone_at && !st.cancelled && raw.length) {
       const dev = devOf.get(st.session) || '?', n = raw.length, cum = new Float64Array(n);
@@ -2401,6 +2414,7 @@ async function handAnalyse(strokes, meta, events, onProgress) {
     if (performance.now() > end) { if (onProgress) onProgress(k / order.length); await yieldNow(); end = performance.now() + 12; }
   }
   return {
+    tone, cutName: tone === 'black' ? 'black' : 'white', inkName: tone === 'black' ? 'white' : 'black',
     lines, timeline, rates, devices, cancelled, white, undo: events.filter((e) => e.type === 'undo').length,
     penMin: penMs / 60000, spanMin: timeline.length ? (timeline[timeline.length - 1][2] - timeline[0][0]) / 60000 : 0,
   };
@@ -2510,10 +2524,10 @@ function hRose(lines, caption) {
   out.push(`<text x="${c + R + 6}" y="${c + 4}">right</text><text x="${c - R - 6}" y="${c + 4}" text-anchor="end">left</text><text x="${c}" y="${c + R + 15}" text-anchor="middle">down</text><text x="${c}" y="${c - R - 6}" text-anchor="middle">up</text>`);
   return hFig(caption, `<svg class="rose" viewBox="-30 -14 300 268" role="img" aria-label="${hEsc(caption)}">${out.join('')}</svg>`);
 }
-function hTimeline(tl) {
+function hTimeline(tl, cutName = 'white') {
   if (tl.length < 40) return '';
   const nw = Math.min(40, Math.floor(tl.length / 15)), cuts = Array.from({ length: nw + 1 }, (_, w) => Math.floor((w * tl.length) / nw));
-  const t0 = tl[0][0], names = [...HAND_CLASSES.map((c) => c[0]), 'Fill (tagged)', 'White marks'];
+  const t0 = tl[0][0], names = [...HAND_CLASSES.map((c) => c[0]), 'Fill (tagged)', `${cutName[0].toUpperCase()}${cutName.slice(1)} marks`];
   const W = 640, H = 150, T = 6, B = 20, bw = W / nw, out = [];
   for (let w = 0; w < nw; w++) {
     const chunk = tl.slice(cuts[w], cuts[w + 1]), cnt = new Array(names.length).fill(0);
@@ -2539,7 +2553,7 @@ function hTimeline(tl) {
 function hTable(head, rows) {
   return `<div class="tw"><table><thead><tr>${head.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
 }
-function hCell(l, white) {
+function hCell(l, white, dark = white) { // white: a cut-in mark (shown at its real width); dark: black cell, white line
   const P = (l.st.cancelled ? l.st.samples : l.st.samples.slice(0, -1)).map((r) => [r[1], r[2]]);
   if (!P.length) return '';
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -2554,15 +2568,15 @@ function hCell(l, white) {
   const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, name = HAND_CLASSES[l.cls][0].toLowerCase().replace(/s$/, '');
   const tip = `${white ? 'White ' + name : name[0].toUpperCase() + name.slice(1)}: ${hG(l.length, 'mm')}, ${white ? `${l.width} mm wide, ` : ''}${hG(l.dur, 'ms')}, peak ${hG(l.peak, 'mm/s')}, pressure ${hG(l.pressure, '', 2)}`;
   const sw = white ? ` style="stroke-width:${Math.max(l.width, size / 60).toFixed(3)}"` : '';
-  return `<svg class="cell${white ? ' neg' : ''}" viewBox="${(cx - size / 2).toFixed(3)} ${(cy - size / 2).toFixed(3)} ${size.toFixed(3)} ${size.toFixed(3)}" data-tip="${hEsc(tip)}" role="img" aria-label="${hEsc(tip)}"><path d="${d}"${sw}/></svg>`;
+  return `<svg class="cell${dark ? ' neg' : ''}${white ? ' real' : ''}" viewBox="${(cx - size / 2).toFixed(3)} ${(cy - size / 2).toFixed(3)} ${size.toFixed(3)} ${size.toFixed(3)}" data-tip="${hEsc(tip)}" role="img" aria-label="${hEsc(tip)}"><path d="${d}"${sw}/></svg>`;
 }
 
 async function handSections(A, meta, emit) { // each section is built and shown in its own slice
   const ink = A.lines.filter((l) => !l.fill && !l.white), whites = A.lines.filter((l) => l.white), nFill = A.lines.filter((l) => l.fill).length, N = ink.length;
   const pauses = ink.map((l) => l.pause).filter((p) => p != null && p < H_BREAK), breaks = ink.filter((l) => l.pause != null && l.pause >= H_BREAK).length;
-  const sub = [nFill ? `${nFill.toLocaleString('en')} fill lines left out` : '', whites.length ? `${whites.length.toLocaleString('en')} white marks on their own` : ''].filter(Boolean).join(', ') || 'all pen lines';
+  const sub = [nFill ? `${nFill.toLocaleString('en')} fill lines left out` : '', whites.length ? `${whites.length.toLocaleString('en')} ${A.cutName} marks on their own` : ''].filter(Boolean).join(', ') || 'all pen lines';
   const cards = [
-    ['Ink lines measured', N.toLocaleString('en'), sub],
+    [A.tone === 'black' ? 'White lines measured' : 'Ink lines measured', N.toLocaleString('en'), sub],
     ['Typical line', hG(hMed(ink.map((l) => l.length)), 'mm'), `${hG(hMed(ink.map((l) => l.dur)), 'ms')} with the pen down`],
     ['Typical pause', hG(hMed(pauses), 'ms'), 'between one line and the next'],
     ['Typical peak speed', hG(hMed(ink.map((l) => l.peak)), 'mm/s'), `fastest 1%: over ${hG(hPctl(ink.map((l) => l.peak), 0.99), 'mm/s')}`],
@@ -2585,7 +2599,7 @@ async function handSections(A, meta, emit) { // each section is built and shown 
     const pick = hSample(ink.filter((l) => l.cls === k), k < 3 ? 24 : 12, 3 + k);
     if (!pick.length) return;
     const box = [0.6, 2, 7][k];
-    sec += `<h3>${name} <span class="sub">${pick.length} at random, ${box ? `each box is ${box} mm wide` : 'each scaled to fit its box'}</span></h3><div class="gal">${pick.map((l) => hCell(l, false)).join('')}</div>`;
+    sec += `<h3>${name} <span class="sub">${pick.length} at random, ${box ? `each box is ${box} mm wide` : 'each scaled to fit its box'}</span></h3><div class="gal">${pick.map((l) => hCell(l, false, A.tone === 'black')).join('')}</div>`;
   });
   sec += '<div class="figs">' + hHist(ink.map((l) => l.length), 0.01, 100, { log: true, unit: 'mm', caption: 'Line length (logarithmic scale)' })
     + hHist(ink.map((l) => l.dur), 1, 5000, { log: true, unit: 'ms', caption: 'Time with the pen down per line (logarithmic scale)' }) + '</div></section>';
@@ -2598,18 +2612,19 @@ async function handSections(A, meta, emit) { // each section is built and shown 
       const ls = whites.filter((l) => l.cls === k);
       if (ls.length) wr.push([name, ls.length.toLocaleString('en'), hPct(ls.length, whites.length), hG(hMed(ls.map((l) => l.dur)), 'ms'), hG(hMed(ls.map((l) => l.peak)), 'mm/s'), hG(hMed(ls.map((l) => l.pressure)), '', 2), [...new Set(ls.map((l) => l.width))].sort((a, b) => a - b).join(', ') + ' mm']);
     });
-    wr.push(['<b>All white marks</b>', `<b>${whites.length.toLocaleString('en')}</b>`, '', hG(hMed(whites.map((l) => l.dur)), 'ms'), hG(hMed(whites.map((l) => l.peak)), 'mm/s'), hG(hMed(whites.map((l) => l.pressure)), '', 2), '']);
-    wr.push(['All ink lines', N.toLocaleString('en'), '', hG(hMed(ink.map((l) => l.dur)), 'ms'), hG(hMed(ink.map((l) => l.peak)), 'mm/s'), hG(hMed(ink.map((l) => l.pressure)), '', 2), '']);
+    wr.push([`<b>All ${A.cutName} marks</b>`, `<b>${whites.length.toLocaleString('en')}</b>`, '', hG(hMed(whites.map((l) => l.dur)), 'ms'), hG(hMed(whites.map((l) => l.peak)), 'mm/s'), hG(hMed(whites.map((l) => l.pressure)), '', 2), '']);
+    wr.push([`All ${A.inkName} lines`, N.toLocaleString('en'), '', hG(hMed(ink.map((l) => l.dur)), 'ms'), hG(hMed(ink.map((l) => l.peak)), 'mm/s'), hG(hMed(ink.map((l) => l.pressure)), '', 2), '']);
     const ts = whites.map((l) => l.t0).sort((a, b) => a - b), first = A.timeline[0][0], spans = [];
     let s0 = ts[0];
     for (let i = 0; i < ts.length; i++) if (i === ts.length - 1 || ts[i + 1] - ts[i] > 5 * 60000) {
       const m0 = Math.round((s0 - first) / 60000), m1 = Math.round((ts[i] - first) / 60000);
       spans.push(m1 > m0 ? `${m0}–${m1} min` : `${m0} min`); s0 = ts[i + 1];
     }
-    await emit(`<section><h2>White marks</h2><p class="lead">${whites.length.toLocaleString('en')} white marks, made with the white pen or by cutting through the ink with the eraser: drawing in white, not corrections. Made in ${spans.length} stretch${spans.length === 1 ? '' : 'es'}: ${spans.join(', ')}.</p>`
+    const Cut = A.cutName[0].toUpperCase() + A.cutName.slice(1);
+    await emit(`<section><h2>${Cut} marks</h2><p class="lead">${whites.length.toLocaleString('en')} ${A.cutName} marks, made with the ${A.cutName} pen or by cutting through the ${A.tone === 'black' ? 'white' : 'ink'} with the eraser: drawing in ${A.cutName}, not corrections. Made in ${spans.length} stretch${spans.length === 1 ? '' : 'es'}: ${spans.join(', ')}.</p>`
       + hTable(['Mark', 'Marks', 'Share', 'Pen down', 'Peak speed', 'Pressure', 'Widths'], wr)
-      + '<p class="note">Medians. Sizes are sorted by the same lengths as ink lines.</p>'
-      + `<h3>Examples <span class="sub">at random, at their real width</span></h3><div class="gal">${hSample(whites, 24, 9).map((l) => hCell(l, true)).join('')}</div></section>`);
+      + `<p class="note">Medians. Sizes are sorted by the same lengths as ${A.inkName} lines.</p>`
+      + `<h3>Examples <span class="sub">at random, at their real width</span></h3><div class="gal">${hSample(whites, 24, 9).map((l) => hCell(l, true, A.tone !== 'black')).join('')}</div></section>`);
   }
 
   // speed, pressure, direction, rhythm
@@ -2644,22 +2659,22 @@ async function handSections(A, meta, emit) { // each section is built and shown 
     + hTable(['Device', 'Lines', 'Sample rate', 'Length', 'Peak speed', 'Pressure', 'Tilt from vertical'], drows) + '</section>');
 
   // this drawing over time; the pictures are painted into the canvases afterwards
-  await emit(`<section><h2>Over time</h2><p class="lead">${(A.timeline.length - A.white).toLocaleString('en')} ink lines and ${A.white.toLocaleString('en')} white marks, ${Math.round(A.penMin)} min with the pen down over ${Math.round(A.spanMin)} min; ${A.undo} undo${A.undo === 1 ? '' : 's'}${A.cancelled ? `, ${A.cancelled} cancelled` : ''}. ${hEsc([...A.devices].join(', '))}.</p>`
-    + hTimeline(A.timeline)
+  await emit(`<section><h2>Over time</h2><p class="lead">${(A.timeline.length - A.white).toLocaleString('en')} ${A.inkName} lines and ${A.white.toLocaleString('en')} ${A.cutName} marks, ${Math.round(A.penMin)} min with the pen down over ${Math.round(A.spanMin)} min; ${A.undo} undo${A.undo === 1 ? '' : 's'}${A.cancelled ? `, ${A.cancelled} cancelled` : ''}. ${hEsc([...A.devices].join(', '))}.</p>`
+    + hTimeline(A.timeline, A.cutName)
     + '<h3>How it grew</h3><div class="frames">' + [25, 50, 75, 100].map((q) => `<figure class="frame"><canvas data-q="${q}" role="img" aria-label="Lines ${q - 25} to ${q}% in black, earlier lines grey"></canvas><figcaption>Lines ${q - 25}–${q}%</figcaption></figure>`).join('') + '</div>'
-    + '<p class="note">Each frame adds a quarter of the lines, in black; earlier lines are grey. Lines are shown as they ended up, with the white marks already cut in.</p>'
+    + `<p class="note">Each frame adds a quarter of the lines, in ${A.inkName}; earlier lines are grey. Lines are shown as they ended up, with the ${A.cutName} marks already cut in.</p>`
     + '<h3>When each part was drawn</h3><div class="tmap"><canvas role="img" aria-label="The drawing coloured by when each line was drawn"></canvas><div class="ramp"><span>first lines</span>' + [0, 1, 2, 3, 4, 5, 6, 7].map((k) => `<i class="t${k}"></i>`).join('') + '<span>last lines</span></div></div></section>');
 }
 
 // growth frames and the time map, painted with the app's own line renderer, a slice at a time
-async function handPictures(root, strokes, isLive) {
+async function handPictures(root, strokes, isLive, meta = S.meta) {
   const vis = strokes.filter((s) => s.tool !== 'eraser' && !s.undone_at && !s.cancelled && s.samples.length).sort((a, b) => a.t0 - b.t0);
   if (!vis.length) return;
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const s of vis) { const b = bboxOf(s); x0 = Math.min(x0, b.x0); y0 = Math.min(y0, b.y0); x1 = Math.max(x1, b.x1); y1 = Math.max(y1, b.y1); }
   const m = Math.max(3, 0.04 * Math.max(x1 - x0, y1 - y0)), box = { x0: x0 - m, y0: y0 - m, w: x1 - x0 + 2 * m, h: y1 - y0 + 2 * m };
   const css = getComputedStyle(root), v = (n) => css.getPropertyValue(n).trim();
-  const paper = v('--paper') || '#ffffff', tpaper = v('--tpaper') || '#ffffff', ramp = [0, 1, 2, 3, 4, 5, 6, 7].map((k) => v(`--t${k}`) || '#2a78d6');
+  const tone = paperTone(meta), paper = tone === 'black' ? '#000000' : v('--paper') || '#ffffff', tpaper = v('--tpaper') || '#ffffff', ramp = [0, 1, 2, 3, 4, 5, 6, 7].map((k) => v(`--t${k}`) || '#2a78d6');
   const make = (cv, px) => { // px: pixels across the width (capped so tall drawings stay reasonable)
     const K = Math.min(px / box.w, (px * 2) / box.h);
     cv.width = Math.max(1, Math.round(box.w * K)); cv.height = Math.max(1, Math.round(box.h * K));
@@ -2691,11 +2706,12 @@ async function handPictures(root, strokes, isLive) {
     const f = make(frames[q], fpx); fill(f.x, paper);
     f.x.setTransform(1, 0, 0, 1, 0, 0); f.x.drawImage(grey, 0, 0);
     const now = order.filter(([, k]) => k >= q * 2 && k < q * 2 + 2);
-    if (!(await paint(f.x, f.K, paper, now, (s) => (s.ink === 'white' ? paper : '#141414')))) return;
-    if (!(await paint(g.x, g.K, paper, now, (s) => (s.ink === 'white' ? paper : '#b9b6ae')))) return;
+    const cut = (s) => (s.ink || 'black') === tone, inkC = tone === 'black' ? '#f4f2ec' : '#141414', greyC = tone === 'black' ? '#5f5c56' : '#b9b6ae';
+    if (!(await paint(f.x, f.K, paper, now, (s) => (cut(s) ? paper : inkC)))) return;
+    if (!(await paint(g.x, g.K, paper, now, (s) => (cut(s) ? paper : greyC)))) return;
   }
   const t = make(tmap, Math.round(Math.min(1400, Math.max(400, (tmap.clientWidth || 500) * dpr)))); fill(t.x, tpaper);
-  await paint(t.x, t.K, tpaper, order, (s, k) => (s.ink === 'white' ? tpaper : ramp[k]));
+  await paint(t.x, t.K, tpaper, order, (s, k) => ((s.ink || 'black') === tone ? tpaper : ramp[k]));
 }
 
 const Hand = {
@@ -2730,7 +2746,7 @@ const Hand = {
       });
     } catch (err) { if (err.message === 'closed') return; throw err; }
     $('#hand-step').textContent = 'Painting the pictures'; $('#hand-fill').style.width = '90%';
-    if (body.querySelector('.frames')) await handPictures(body, strokes, live);
+    if (body.querySelector('.frames')) await handPictures(body, strokes, live, meta);
     if (live()) $('#hand-progress').hidden = true;
   },
   close() { this.gen++; $('#hand-dlg').close(); $('#hand-tip').hidden = true; },
@@ -3104,7 +3120,7 @@ function bindUI() {
   $('#n-cancel').onclick = () => $('#new-dlg').close();
   $('#n-create').onclick = async () => {
     $('#new-dlg').close(); $('#menu').close();
-    await newDrawing($('#n-paper').value, $('#n-orient').value === 'l', $('#n-title').value.trim());
+    await newDrawing($('#n-paper').value, $('#n-orient').value === 'l', $('#n-title').value.trim(), $('#n-tone').value);
   };
   $('#c-range').oninput = (e) => { calibPx = Number(e.target.value); calibUpdate(); };
   $('#c-minus').onclick = () => { calibPx = Math.max(80, calibPx - 0.5); calibUpdate(); };

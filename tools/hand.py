@@ -31,6 +31,7 @@ CLASSES = [
     ("Long lines", 6.0, math.inf, "over 6 mm: contours, construction"),
 ]
 FILL = len(CLASSES)          # timeline category for lines tagged as fill
+CUT_NAME = "white"           # what marks in the paper's colour are called (set per report)
 WHITE = FILL + 1             # timeline category for white marks (eraser strokes: drawing in white, not corrections)
 SPEED_WINDOW_MS = 10         # speed is measured over at least this much time (dense pens jitter)
 BREAK_MS = 60_000            # pauses longer than this are breaks, not rhythm
@@ -77,6 +78,7 @@ class Sheet:
     timeline: list            # (t0, category) for every pen line, in time order
     undo: int = 0
     white: int = 0
+    tone: str = "white"       # paper colour; "black" is a negative drawing
     cancelled: int = 0
     span_min: float = 0.0
     pen_min: float = 0.0
@@ -116,11 +118,12 @@ def analyse(files):
         paper = d.meta.get("paper") or {}
         sh = Sheet(d.id, d.meta.get("title") or "", (0, 0, paper.get("w_mm", 210), paper.get("h_mm", 297)), [], [])
         sh.undo = sum(e.get("type") == "undo" for e in d.events)
+        sh.tone = d.tone
         prev = None
         for st in order:
             raw = st.raw if st.cancelled else st.raw[:-1]   # last row is the pen-up event
             end = st.t0 + float(st.raw[-1, 0])
-            white = st.tool == "eraser" or st.ink == "white"   # cut-through eraser or white pen: both draw in white
+            white = st.tool == "eraser" or (st.ink or "black") == sh.tone   # cut back into the drawing: eraser, or ink the colour of the paper
             sh.cancelled += st.cancelled
             if not st.undone and not st.cancelled and len(raw):
                 dev = dev_of.get(st.session, "?")
@@ -170,7 +173,7 @@ def analyse(files):
                 if not len(seg):
                     continue
                 seg = seg[:, 1:3]
-                sh.paths.append((rank[s.i] / max(1, len(vis)), s.width_mm, path_data(seg.tolist()), s.ink == "white"))
+                sh.paths.append((rank[s.i] / max(1, len(vis)), s.width_mm, path_data(seg.tolist()), (s.ink or "black") == sh.tone))
                 x0 = min(x0, seg[:, 0].min()); x1 = max(x1, seg[:, 0].max())
                 y0 = min(y0, seg[:, 1].min()); y1 = max(y1, seg[:, 1].max())
         if x0 < math.inf:   # cropped to the drawing, with a little paper around it
@@ -387,7 +390,7 @@ def timeline(sh, n_win=40):
     n_win = min(n_win, len(tl) // 15)
     cuts = np.linspace(0, len(tl), n_win + 1).astype(int)
     t_start = tl[0][0]
-    names = [c[0] for c in CLASSES] + ["Fill (tagged)", "White (eraser)"]
+    names = [c[0] for c in CLASSES] + ["Fill (tagged)", CUT_NAME.capitalize() + " marks"]
     W, H, T, B = 640, 150, 6, 20
     bw = W / n_win
     out = []
@@ -429,14 +432,15 @@ def sheet_pictures(sh, idx):
     for q, upto in ((25, 2), (50, 4), (75, 6), (100, 8)):
         old = "".join(f'<use href="#d{idx}b{k}"/>' for k in range(upto - 2))
         new = "".join(f'<use href="#d{idx}b{k}"/>' for k in range(upto - 2, upto))
-        frames.append(f'<figure class="frame"><svg viewBox="{vb}" role="img" aria-label="The drawing after {q}% of its lines; the last quarter in black">'
+        neg = ' style="--paper:#000000;--pen:#f4f2ec;--old:#5f5c56"' if sh.tone == "black" else ""
+        frames.append(f'<figure class="frame"><svg{neg} viewBox="{vb}" role="img" aria-label="The drawing after {q}% of its lines; the last quarter in black">'
                       f'<rect class="paper" x="{x0}" y="{y0}" width="{w}" height="{h}"/><g class="ink old">{old}</g><g class="ink">{new}</g></svg>'
                       f'<figcaption>Lines {q - 25}–{q}%</figcaption></figure>')
     tmap = "".join(f'<use href="#d{idx}b{k}" class="t{k}"/>' for k in range(nb))
     ramp = '<div class="ramp"><span>first lines</span>' + "".join(f'<i class="t{k}"></i>' for k in range(nb)) + '<span>last lines</span></div>'
     return (f'<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>{defs}</defs></svg>'
             f'<h3>How it grew</h3><div class="frames">{"".join(frames)}</div>'
-            f'<p class="note">Each frame adds a quarter of the lines, in black; earlier lines are grey. Lines are shown as they ended up, with the white marks already cut in.</p>'
+            f'<p class="note">Each frame adds a quarter of the lines, in {"white" if sh.tone == "black" else "black"}; earlier lines are grey. Lines are shown as they ended up, with the {CUT_NAME} marks already cut in.</p>'
             f'<h3>When each part was drawn</h3><div class="tmap"><svg viewBox="{vb}" role="img" aria-label="The drawing coloured by when each line was drawn">'
             f'<rect class="paper2" x="{x0}" y="{y0}" width="{w}" height="{h}"/><g class="tink">{tmap}</g></svg>{ramp}</div>')
 
@@ -459,6 +463,10 @@ def table(head, rows, cls=""):
 
 
 def report(files, lines, sheets, rates, galleries, white_gallery):
+    global CUT_NAME
+    tones = {s.tone for s in sheets}
+    CUT_NAME = "white" if tones == {"white"} else "black" if tones == {"black"} else "cut-in"
+    INK = "white" if tones == {"black"} else "ink"
     motor = [l for l in lines if not l.fill and not l.white]
     whites = [l for l in lines if l.white]
     n_fill = sum(l.fill for l in lines)
@@ -471,7 +479,7 @@ def report(files, lines, sheets, rates, galleries, white_gallery):
     devs = sorted({l.device for l in lines})
     # key numbers
     cards = [
-        ("Ink lines measured", f"{N:,}", ", ".join(x for x in (f"{n_fill:,} fill lines left out" if n_fill else "", f"{len(whites):,} white marks on their own" if whites else "") if x) or "all pen lines"),
+        (f"{INK.capitalize()} lines measured", f"{N:,}", ", ".join(x for x in (f"{n_fill:,} fill lines left out" if n_fill else "", f"{len(whites):,} {CUT_NAME} marks on their own" if whites else "") if x) or "all pen lines"),
         ("Typical line", g(med([l.length for l in motor]), "mm"), f"{g(med([l.dur for l in motor]), 'ms')} with the pen down"),
         ("Typical pause", g(med(pauses), "ms"), "between one line and the next"),
         ("Typical peak speed", g(med([l.peak for l in motor]), "mm/s"), f"fastest 1%: over {g(float(np.percentile([l.peak for l in motor], 99)) if motor else math.nan, 'mm/s')}"),
@@ -520,9 +528,9 @@ def report(files, lines, sheets, rates, galleries, white_gallery):
                 rows.append([esc(name), f"{len(ls):,}", pct(len(ls), len(whites)), g(med([l.dur for l in ls]), "ms"),
                              g(med([l.peak for l in ls]), "mm/s"), g(med([l.pressure for l in ls]), "", 2),
                              esc(", ".join(f"{w:g}" for w in sorted({l.width for l in ls}))) + " mm"])
-        rows.append(["<b>All white marks</b>", f"<b>{len(whites):,}</b>", "", g(med([l.dur for l in whites]), "ms"),
+        rows.append([f"<b>All {CUT_NAME} marks</b>", f"<b>{len(whites):,}</b>", "", g(med([l.dur for l in whites]), "ms"),
                      g(med([l.peak for l in whites]), "mm/s"), g(med([l.pressure for l in whites]), "", 2), ""])
-        rows.append(["All ink lines", f"{N:,}", "", g(med([l.dur for l in motor]), "ms"), g(med([l.peak for l in motor]), "mm/s"),
+        rows.append([f"All {INK} lines", f"{N:,}", "", g(med([l.dur for l in motor]), "ms"), g(med([l.peak for l in motor]), "mm/s"),
                      g(med([l.pressure for l in motor]), "", 2), ""])
         ts = sorted((l.d, l.t0) for l in whites)
         spans, start = [], ts[0]
@@ -539,11 +547,11 @@ def report(files, lines, sheets, rates, galleries, white_gallery):
             box = {0: 0.6, 1: 2.0, 2: 7.0}.get(l.cls)
             cx, cy = (seg[:, 0].min() + seg[:, 0].max()) / 2, (seg[:, 1].min() + seg[:, 1].max()) / 2
             size = max(box or max(np.ptp(seg[:, 0]), np.ptp(seg[:, 1]), 1) * 1.15, max(np.ptp(seg[:, 0]), np.ptp(seg[:, 1])) + l.width * 1.6)
-            tip = f"White {CLASSES[l.cls][0].lower().rstrip('s')}: {g(l.length, 'mm')}, {l.width:g} mm wide, {g(l.dur, 'ms')}, pressure {g(l.pressure, '', 2)}"
+            tip = f"{CUT_NAME.capitalize()} {CLASSES[l.cls][0].lower().rstrip('s')}: {g(l.length, 'mm')}, {l.width:g} mm wide, {g(l.dur, 'ms')}, pressure {g(l.pressure, '', 2)}"
             cells.append(f'<svg class="cell neg" viewBox="{cx - size / 2:.3f} {cy - size / 2:.3f} {size:.3f} {size:.3f}" data-tip="{esc(tip)}" role="img" aria-label="{esc(tip)}">'
                          f'<path d="{path_data(seg.tolist(), step=size / 200)}" style="stroke-width:{max(l.width, size / 60):.3f}"/></svg>')
-        body.append(f'<section><h2>White marks</h2><p class="lead">{len(whites):,} white marks, made with the white pen or by cutting through the ink with the eraser: '
-                    f'drawing in white, not corrections. Made in {len(spans)} stretch{"es" * (len(spans) != 1)}: {esc(", ".join(spans))}.</p>'
+        body.append(f'<section><h2>{CUT_NAME.capitalize()} marks</h2><p class="lead">{len(whites):,} {CUT_NAME} marks, made with ink the colour of the paper or by cutting through with the eraser: '
+                    f'drawing back into the drawing, not corrections. Made in {len(spans)} stretch{"es" * (len(spans) != 1)}: {esc(", ".join(spans))}.</p>'
                     + table(["Mark", "Marks", "Share", "Pen down", "Peak speed", "Pressure", "Widths"], rows, "num")
                     + '<p class="note">Medians. Sizes are sorted by the same lengths as ink lines.</p>'
                     + f'<h3>Examples <span class="sub">{len(cells)} at random, at their real width; boxes as for ink lines, or larger to fit a wide mark</span></h3>'
@@ -611,13 +619,13 @@ def report(files, lines, sheets, rates, galleries, white_gallery):
     # drawings
     for idx, sh in enumerate(sheets):
         nm = esc(sh.title or sh.id)
-        facts = (f"{len(sh.timeline) - sh.white:,} ink lines and {sh.white:,} white marks, {sh.pen_min:.0f} min with the pen down over {sh.span_min:.0f} min; "
+        facts = (f"{'Negative drawing (black paper). ' if sh.tone == 'black' else ''}{len(sh.timeline) - sh.white:,} {'white' if sh.tone == 'black' else 'ink'} lines and {sh.white:,} {'black' if sh.tone == 'black' else 'white'} marks, {sh.pen_min:.0f} min with the pen down over {sh.span_min:.0f} min; "
                  f"{sh.undo} undo{'s' * (sh.undo != 1)}{f', {sh.cancelled} cancelled' if sh.cancelled else ''}. {esc(', '.join(sorted(sh.devices)))}.")
         body.append(f'<section><h2>{nm}</h2><p class="lead">{facts}</p>{timeline(sh)}{sheet_pictures(sh, idx)}</section>')
 
     src = ", ".join(esc(Path(p).name) for p in files[:6]) + (f" and {len(files) - 6} more" if len(files) > 6 else "")
     head = (f'<h1>Your hand</h1><p class="sub">{len(files)} drawing{"s" * (len(files) != 1)}: {src}. '
-            f'Movement from the pen as recorded. Statistics are for ink lines; fill lines are left out and white marks (made with the eraser) have their own section. Hover or tap a chart for numbers.</p>')
+            f'Movement from the pen as recorded. Statistics are for lines that contrast with the paper; fill lines are left out, and marks in the paper\'s colour (cut back in) have their own section. Hover or tap a chart for numbers.</p>')
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>Your hand</title><style>{CSS}</style></head><body><main>{head}{"".join(body)}</main>'
             f'<div id="tip" role="tooltip" hidden></div><script>{JS}</script></body></html>')
@@ -675,7 +683,7 @@ rect.s4,.sw.s4{fill:var(--s4);background:var(--s4)} rect.s5,.sw.s5{fill:var(--s5
 .cell path{fill:none;stroke:var(--pen);stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke}
 .frames{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(46%,200px),1fr));gap:12px}
 .frame figcaption{margin:4px 0 0}
-.paper{fill:var(--paper)} .paper2{fill:var(--tpaper)} .frame svg{--wm:var(--paper)} .tmap svg{--wm:var(--tpaper)} .ink.old{stroke:#b9b6ae}
+.paper{fill:var(--paper)} .paper2{fill:var(--tpaper)} .frame svg{--wm:var(--paper)} .tmap svg{--wm:var(--tpaper)} .ink.old{stroke:var(--old,#b9b6ae)}
 .ink,.tink{fill:none;stroke-linecap:round;stroke-linejoin:round} .ink{stroke:var(--pen)}
 .frame svg,.tmap svg{border-radius:4px;box-shadow:0 0 0 1px var(--line)}
 .tmap{max-width:520px}
@@ -734,7 +742,7 @@ def main():
     out.write_text(html_out, encoding="utf-8")
     N = len(motor)
     pauses = [l.pause for l in motor if l.pause is not None and l.pause < BREAK_MS]
-    print(f"{len(files)} drawing(s), {N} ink lines measured ({sum(l.fill for l in lines)} fill lines left out), {len(whites)} white marks (eraser)")
+    print(f"{len(files)} drawing(s), {N} lines measured ({sum(l.fill for l in lines)} fill lines left out), {len(whites)} marks cut back in (paper-colour ink or eraser)")
     for k, (name, *_r) in enumerate(CLASSES):
         ls = [l for l in motor if l.cls == k]
         print(f"  {name:12} {len(ls):6}  {100 * len(ls) / N:4.0f}%   median {med([l.dur for l in ls]):6.0f} ms, peak {med([l.peak for l in ls]):6.1f} mm/s")
